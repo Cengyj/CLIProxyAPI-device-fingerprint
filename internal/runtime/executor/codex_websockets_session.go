@@ -67,6 +67,7 @@ type codexWebsocketSession struct {
 	authID                    string
 	proxyURL                  string
 	useSIWC                   bool
+	device                    codexWebsocketDeviceSnapshot // guarded by connMu
 	connCfg                   *config.Config
 	hasConnCfg                bool
 	multiAgentV2OptimizedConn *websocket.Conn
@@ -108,6 +109,56 @@ type codexWebsocketSession struct {
 	lastEventMu   sync.Mutex
 	lastEventConn *websocket.Conn
 	lastEventType string
+}
+
+// codexWebsocketDeviceSnapshot belongs to one physical connection. Identity
+// observes final payload/header rules; policy remains immutable for controls.
+type codexWebsocketDeviceSnapshot struct {
+	policy   helps.CodexDevicePolicy
+	identity helps.CodexDeviceIdentity
+}
+
+// Controls have no ordinary payload rules. Prefer the one effective final UUID
+// represented on the connection; ambiguous administrator values are checked
+// against the final control fields and may require a full replay.
+func (d codexWebsocketDeviceSnapshot) controlPolicy() helps.CodexDevicePolicy {
+	policy := d.policy
+	if id, ok := d.identity.EffectiveID(); ok {
+		policy.ID = id
+	}
+	policy.InjectMissing = false
+	return policy
+}
+
+func (s *codexWebsocketSession) deviceForConn(conn *websocket.Conn) (codexWebsocketDeviceSnapshot, bool) {
+	if s == nil || conn == nil {
+		return codexWebsocketDeviceSnapshot{}, false
+	}
+	s.connMu.Lock()
+	defer s.connMu.Unlock()
+	return s.device, s.conn == conn
+}
+
+func (s *codexWebsocketSession) hasDevicePolicy() bool {
+	if s == nil {
+		return false
+	}
+	s.connMu.Lock()
+	defer s.connMu.Unlock()
+	return s.conn != nil && s.device.policy.Enabled
+}
+
+func (s *codexWebsocketSession) bindDevice(conn *websocket.Conn, device codexWebsocketDeviceSnapshot) bool {
+	if s == nil || conn == nil {
+		return false
+	}
+	s.connMu.Lock()
+	defer s.connMu.Unlock()
+	if s.conn != conn || !s.device.identity.Compatible(device.identity) {
+		return false
+	}
+	s.device.identity = s.device.identity.Merge(device.identity)
+	return true
 }
 
 type codexWebsocketRead struct {
@@ -420,6 +471,7 @@ func (s *codexWebsocketSession) detachConnection(conn *websocket.Conn, lifecycle
 	if matched {
 		closer = s.connCloser
 		s.conn = nil
+		s.device = codexWebsocketDeviceSnapshot{}
 		s.connCloser = nil
 		s.connCfg = nil
 		s.hasConnCfg = false
@@ -476,6 +528,22 @@ func existingWebsocketSessionConn(sess *codexWebsocketSession, authID string, ws
 	return conn, closer
 }
 
+// This variant is used only by Codex; other providers sharing the session
+// transport keep the original target-only contract.
+func existingCodexWebsocketSessionConn(sess *codexWebsocketSession, authID, wsURL, proxyURL string, useSIWC bool, device codexWebsocketDeviceSnapshot) (*websocket.Conn, *websocketConnectionCloser) {
+	conn, closer := existingWebsocketSessionConn(sess, authID, wsURL, proxyURL, useSIWC)
+	if conn == nil {
+		return nil, nil
+	}
+	sess.connMu.Lock()
+	matches := sess.conn == conn && sess.device.identity.Compatible(device.identity)
+	sess.connMu.Unlock()
+	if !matches {
+		return nil, nil
+	}
+	return conn, closer
+}
+
 func (s *codexWebsocketSession) effectiveConfig(authID string, fallback *config.Config) *config.Config {
 	if s == nil {
 		return fallback
@@ -518,6 +586,10 @@ func codexWebsocketRequestUsesSIWC(ctx context.Context, auth *cliproxyauth.Auth,
 }
 
 func detachMismatchedWebsocketSessionConn(sess *codexWebsocketSession, authID string, wsURL string, proxyURL string, useSIWC ...bool) (*websocket.Conn, *websocketConnectionCloser, string, string, cliproxyexecutor.ExecutionLifecycle) {
+	return detachMismatchedCodexWebsocketSessionConn(sess, authID, wsURL, proxyURL, nil, useSIWC...)
+}
+
+func detachMismatchedCodexWebsocketSessionConn(sess *codexWebsocketSession, authID, wsURL, proxyURL string, device *codexWebsocketDeviceSnapshot, useSIWC ...bool) (*websocket.Conn, *websocketConnectionCloser, string, string, cliproxyexecutor.ExecutionLifecycle) {
 	if sess == nil {
 		return nil, nil, "", "", nil
 	}
@@ -525,7 +597,7 @@ func detachMismatchedWebsocketSessionConn(sess *codexWebsocketSession, authID st
 	sess.connMu.Lock()
 	defer sess.connMu.Unlock()
 	conn := sess.conn
-	if conn == nil || websocketSessionTargetMatches(sess, authID, wsURL, proxyURL, useSIWC...) {
+	if conn == nil || (websocketSessionTargetMatches(sess, authID, wsURL, proxyURL, useSIWC...) && (device == nil || sess.device.identity.Compatible(device.identity))) {
 		return nil, nil, "", "", nil
 	}
 
@@ -536,6 +608,7 @@ func detachMismatchedWebsocketSessionConn(sess *codexWebsocketSession, authID st
 	sess.lifecycle = nil
 	sess.lifecycleModel = ""
 	sess.conn = nil
+	sess.device = codexWebsocketDeviceSnapshot{}
 	sess.connCloser = nil
 	sess.connCfg = nil
 	sess.hasConnCfg = false
@@ -711,7 +784,11 @@ func (e *CodexWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *
 	return e.ensureUpstreamConnWithSIWC(ctx, auth, sess, authID, wsURL, headers, codexWebsocketRequestUsesSIWC(ctx, auth, headers))
 }
 
-func (e *CodexWebsocketsExecutor) ensureUpstreamConnWithSIWC(ctx context.Context, auth *cliproxyauth.Auth, sess *codexWebsocketSession, authID string, wsURL string, headers http.Header, useSIWC bool) (*websocket.Conn, *websocketConnectionCloser, *http.Response, error) {
+func (e *CodexWebsocketsExecutor) ensureUpstreamConnWithSIWC(ctx context.Context, auth *cliproxyauth.Auth, sess *codexWebsocketSession, authID string, wsURL string, headers http.Header, useSIWC bool, devices ...codexWebsocketDeviceSnapshot) (*websocket.Conn, *websocketConnectionCloser, *http.Response, error) {
+	var device codexWebsocketDeviceSnapshot
+	if len(devices) > 0 {
+		device = devices[0]
+	}
 	if sess == nil {
 		conn, closer, resp, err := e.dialCodexWebsocket(ctx, auth, wsURL, headers)
 		if conn != nil {
@@ -720,7 +797,7 @@ func (e *CodexWebsocketsExecutor) ensureUpstreamConnWithSIWC(ctx context.Context
 		return conn, closer, resp, err
 	}
 	proxyURL := executionProxyURL(ctx, sess.effectiveConfig(authID, e.cfg), auth)
-	if staleConn, staleCloser, staleAuthID, staleWSURL, staleLifecycle := detachMismatchedWebsocketSessionConn(sess, authID, wsURL, proxyURL, useSIWC); staleConn != nil {
+	if staleConn, staleCloser, staleAuthID, staleWSURL, staleLifecycle := detachMismatchedCodexWebsocketSessionConn(sess, authID, wsURL, proxyURL, &device, useSIWC); staleConn != nil {
 		staleLastEvent := sess.getLastEventType(staleConn)
 		logCodexWebsocketDisconnectedWithLastEvent(sess, sess.sessionID, staleAuthID, staleWSURL, "target_changed", staleLastEvent, nil)
 		if staleCloser != nil {
@@ -737,7 +814,11 @@ func (e *CodexWebsocketsExecutor) ensureUpstreamConnWithSIWC(ctx context.Context
 	conn := sess.conn
 	closer := sess.connCloser
 	readerConn := sess.readerConn
+	matches := conn == nil || (websocketSessionTargetMatches(sess, authID, wsURL, proxyURL, useSIWC) && sess.device.identity.Compatible(device.identity))
 	sess.connMu.Unlock()
+	if !matches {
+		return nil, nil, nil, cliproxyexecutor.NewUpstreamWebsocketReplayRequiredError()
+	}
 	if conn != nil {
 		if readerConn != conn {
 			sess.connMu.Lock()
@@ -760,7 +841,14 @@ func (e *CodexWebsocketsExecutor) ensureUpstreamConnWithSIWC(ctx context.Context
 	}
 
 	sess.connMu.Lock()
-	if sess.conn != nil && websocketSessionTargetMatches(sess, authID, wsURL, dialProxyURL, useSIWC) {
+	if sess.conn != nil {
+		if !websocketSessionTargetMatches(sess, authID, wsURL, dialProxyURL, useSIWC) || !sess.device.identity.Compatible(device.identity) {
+			sess.connMu.Unlock()
+			if errClose := closer.Close(); errClose != nil {
+				log.Errorf("codex websockets executor: close competing websocket error: %v", errClose)
+			}
+			return nil, nil, nil, cliproxyexecutor.NewUpstreamWebsocketReplayRequiredError()
+		}
 		previous := sess.conn
 		previousCloser := sess.connCloser
 		sess.connMu.Unlock()
@@ -771,6 +859,7 @@ func (e *CodexWebsocketsExecutor) ensureUpstreamConnWithSIWC(ctx context.Context
 		return previous, previousCloser, nil, nil
 	}
 	sess.conn = conn
+	sess.device = device
 	sess.connCloser = closer
 	sess.connCfg = e.cfg
 	sess.hasConnCfg = true
@@ -945,6 +1034,7 @@ func (e *CodexWebsocketsExecutor) invalidateUpstreamConnWithNotify(sess *codexWe
 	sess.lifecycle = nil
 	sess.lifecycleModel = ""
 	sess.conn = nil
+	sess.device = codexWebsocketDeviceSnapshot{}
 	sess.connCloser = nil
 	sess.connCfg = nil
 	sess.hasConnCfg = false
@@ -1080,6 +1170,7 @@ func closeCodexWebsocketSession(sess *codexWebsocketSession, reason string) {
 	sess.lifecycle = nil
 	sess.lifecycleModel = ""
 	sess.conn = nil
+	sess.device = codexWebsocketDeviceSnapshot{}
 	sess.connCloser = nil
 	sess.connCfg = nil
 	sess.hasConnCfg = false

@@ -18,7 +18,7 @@ import (
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 )
 
-func (e *CodexWebsocketsExecutor) prepareSessionInstructions(ctx context.Context, doc *ojson.Doc, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, sess *codexWebsocketSession, wsURL string, useSIWC bool) (helps.CodexInstructionTurn, error) {
+func (e *CodexWebsocketsExecutor) prepareSessionInstructions(ctx context.Context, doc *ojson.Doc, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, sess *codexWebsocketSession, wsURL string, useSIWC bool, devicePolicy helps.CodexDevicePolicy) (helps.CodexInstructionTurn, error) {
 	if sess == nil || opts.SourceFormat != sdktranslator.FormatOpenAIResponse {
 		return helps.PrepareCodexSessionInstructions(ctx, doc, req, opts, nil, nil, false)
 	}
@@ -27,6 +27,15 @@ func (e *CodexWebsocketsExecutor) prepareSessionInstructions(ctx context.Context
 		authID = auth.ID
 	}
 	conn, _ := existingWebsocketSessionConn(sess, authID, wsURL, executionProxyURL(ctx, sess.effectiveConfig(authID, e.cfg), auth), useSIWC)
+	// A changed mode cannot provide continuation proof. Final effective values
+	// are checked after user rules, before the old connection can be used.
+	if conn != nil {
+		sess.connMu.Lock()
+		if sess.conn != conn || sess.device.policy.Enabled != devicePolicy.Enabled {
+			conn = nil
+		}
+		sess.connMu.Unlock()
+	}
 	return helps.PrepareCodexSessionInstructions(ctx, doc, req, opts, &sess.sessionInstructions, conn, false)
 }
 
@@ -107,7 +116,11 @@ func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *
 		ginHeaders = ginCtx.Request.Header.Clone()
 	}
 
-	if codexUseSIWCForRequest(ctx, auth, clientHeaders...) {
+	useSIWC := codexUseSIWCForRequest(ctx, auth, clientHeaders...)
+	if policy, ok := helps.CodexDevicePolicyFromContext(ctx); ok && policy.Enabled {
+		useSIWC = policy.SIWC
+	}
+	if useSIWC {
 		deleteHeaderCaseInsensitive(headers, "conversation_id")
 		ensureCodexWebsocketSessionHeader(headers, ginHeaders, "")
 		if sessionID := codexSessionHeaderValue(headers); sessionID != "" {
@@ -127,6 +140,9 @@ func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *
 		var attrs map[string]string
 		if auth != nil {
 			attrs = auth.Attributes
+		}
+		if devicePolicy, ok := helps.CodexDevicePolicyFromContext(ctx); ok {
+			devicePolicy.ApplyHeadersFromSource(headers, ginHeaders)
 		}
 		req := (&http.Request{Header: headers}).WithContext(ctx)
 		util.ApplyCustomHeadersFromAttrs(req, attrs, ginHeaders)
@@ -192,6 +208,9 @@ func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *
 	var attrs map[string]string
 	if auth != nil {
 		attrs = auth.Attributes
+	}
+	if devicePolicy, ok := helps.CodexDevicePolicyFromContext(ctx); ok {
+		devicePolicy.ApplyHeadersFromSource(headers, ginHeaders)
 	}
 	req := (&http.Request{Header: headers}).WithContext(ctx)
 	util.ApplyCustomHeadersFromAttrs(req, attrs, ginHeaders)

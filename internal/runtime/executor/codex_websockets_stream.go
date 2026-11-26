@@ -136,8 +136,9 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	var respHS *http.Response
 	var errDial error
 	dialCtx := ctx
-	if cliproxyexecutor.RequiredUpstreamWebsocket(ctx) || prepared.sessionInstructions.ConnectionBound() {
-		conn, closer = existingWebsocketSessionConn(sess, authID, wsURL, executionProxyURL(ctx, sess.effectiveConfig(authID, e.cfg), auth), useSIWC)
+	deviceConnectionBound := (prepared.device.policy.Enabled || sess.hasDevicePolicy()) && strings.TrimSpace(ojson.GetBytesNoCopy(clientBody, "previous_response_id").String()) != ""
+	if cliproxyexecutor.RequiredUpstreamWebsocket(ctx) || prepared.sessionInstructions.ConnectionBound() || deviceConnectionBound {
+		conn, closer = existingCodexWebsocketSessionConn(sess, authID, wsURL, executionProxyURL(ctx, sess.effectiveConfig(authID, e.cfg), auth), useSIWC, prepared.device)
 		if conn == nil {
 			unlockStreamSession()
 			if errConn := prepared.sessionInstructions.OnConnection(nil); errConn != nil {
@@ -156,7 +157,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		}
 	} else {
 		dialCtx = cliproxyexecutor.WithUpstreamAttemptTracker(ctx)
-		conn, closer, respHS, errDial = e.ensureUpstreamConnWithSIWC(dialCtx, auth, sess, authID, wsURL, wsHeaders, useSIWC)
+		conn, closer, respHS, errDial = e.ensureUpstreamConnWithSIWC(dialCtx, auth, sess, authID, wsURL, wsHeaders, useSIWC, prepared.device)
 	}
 	var upstreamHeaders http.Header
 	if respHS != nil {
@@ -187,6 +188,10 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		}
 		unlockStreamSession()
 		return nil, errDial
+	}
+	if !sess.bindDevice(conn, prepared.device) {
+		unlockStreamSession()
+		return nil, cliproxyexecutor.NewUpstreamWebsocketReplayRequiredError()
 	}
 	if errConn := prepared.sessionInstructions.OnConnection(conn); errConn != nil {
 		unlockStreamSession()
@@ -236,7 +241,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			}
 		}
 		if sess != nil && !isEphemeralSession {
-			if cliproxyexecutor.RequiredUpstreamWebsocket(ctx) {
+			if cliproxyexecutor.RequiredUpstreamWebsocket(ctx) || deviceConnectionBound {
 				e.invalidateUpstreamConnWithoutDisconnectNotify(sess, conn, "send_error", errSend)
 				sess.clearActive(conn, readCh)
 				sess.reqMu.Unlock()
@@ -259,7 +264,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			}
 
 			// Retry once with a new websocket connection for the same execution session.
-			connRetry, closerRetry, respHSRetry, errDialRetry := e.ensureUpstreamConnWithSIWC(ctx, auth, sess, authID, wsURL, wsHeaders, useSIWC)
+			connRetry, closerRetry, respHSRetry, errDialRetry := e.ensureUpstreamConnWithSIWC(ctx, auth, sess, authID, wsURL, wsHeaders, useSIWC, prepared.device)
 			if errDialRetry != nil || connRetry == nil {
 				_ = recordWebsocketDialRetryFailure(ctx, e.cfg, wsReqLog, respHSRetry, errDialRetry)
 				sess.clearActive(conn, readCh)
@@ -897,6 +902,7 @@ type codexWebsocketPrepared struct {
 	wsURL                string
 	wsHeaders            http.Header
 	useSIWC              bool
+	device               codexWebsocketDeviceSnapshot
 	replayScope          codexReasoningReplayScope
 	optimizeMultiAgentV2 bool
 	multiAgentV2Conflict bool
@@ -909,6 +915,16 @@ type codexWebsocketPrepared struct {
 }
 
 func (e *CodexWebsocketsExecutor) prepareCodexWebsocketStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, sessions ...*codexWebsocketSession) (*codexWebsocketPrepared, error) {
+	var sess *codexWebsocketSession
+	if len(sessions) > 0 {
+		sess = sessions[0]
+	}
+	return e.prepareCodexWebsocketStreamWithDevice(ctx, auth, req, opts, sess, nil)
+}
+
+// Only an active duplex supplies a frozen device policy; ordinary attempts
+// always resolve against the selected credential and current configuration.
+func (e *CodexWebsocketsExecutor) prepareCodexWebsocketStreamWithDevice(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, sess *codexWebsocketSession, frozen *helps.CodexDevicePolicy) (*codexWebsocketPrepared, error) {
 	if errPrev := rejectSyntheticCompactionPreviousResponseID(ctx, req.Payload); errPrev != nil {
 		return nil, errPrev
 	}
@@ -1007,16 +1023,31 @@ func (e *CodexWebsocketsExecutor) prepareCodexWebsocketStream(ctx context.Contex
 	if useSIWC {
 		applyCodexSIWCWebsocketBodyRulesDoc(doc, hasExplicitInstructions, cliproxyexecutor.Options{KeepTopLevelEffort: thinking.HasThinkingSuffix(req.Model)})
 	}
-	var sess *codexWebsocketSession
-	if len(sessions) > 0 {
-		sess = sessions[0]
+	var devicePolicy helps.CodexDevicePolicy
+	if frozen != nil {
+		devicePolicy = *frozen
+		if !e.deviceResolver.CompatibleFrozenAuth(devicePolicy, auth, useSIWC, httpURL) {
+			return nil, cliproxyexecutor.NewUpstreamWebsocketReplayRequiredError()
+		}
+	} else {
+		devicePolicy = e.deviceResolver.Resolve(e.cfg, auth, useSIWC, httpURL)
 	}
-	sessionInstructions, errSession := e.prepareSessionInstructions(ctx, doc, auth, req, opts, sess, wsURL, useSIWC)
+	ctx = helps.WithCodexDevicePolicy(ctx, devicePolicy)
+	if errDevice := devicePolicy.ValidateInput(req.Payload); errDevice != nil {
+		return nil, errDevice
+	}
+	if errDevice := devicePolicy.ApplyDoc(doc, false, body); errDevice != nil {
+		return nil, errDevice
+	}
+	sessionInstructions, errSession := e.prepareSessionInstructions(ctx, doc, auth, req, opts, sess, wsURL, useSIWC, devicePolicy)
 	if errSession != nil {
 		return nil, errSession
 	}
 	helps.FinalizePayloadDoc(ctx, doc)
 	body = doc.Bytes()
+	if errDevice := devicePolicy.ValidateInput(body); errDevice != nil {
+		return nil, errDevice
+	}
 	if errMarker := helps.ValidateCodexSessionInstructionMarker(body, from); errMarker != nil {
 		return nil, errMarker
 	}
@@ -1042,6 +1073,7 @@ func (e *CodexWebsocketsExecutor) prepareCodexWebsocketStream(ctx context.Contex
 		wsURL:                wsURL,
 		wsHeaders:            wsHeaders,
 		useSIWC:              useSIWC,
+		device:               codexWebsocketDeviceSnapshot{policy: devicePolicy, identity: devicePolicy.Identity(doc, wsHeaders)},
 		replayScope:          replayScope,
 		optimizeMultiAgentV2: optimizeMultiAgentV2,
 		multiAgentV2Conflict: multiAgentV2Conflict,

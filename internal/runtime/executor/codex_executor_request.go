@@ -152,13 +152,17 @@ func (e *CodexExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth
 
 func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Format, url string, req cliproxyexecutor.Request, rawJSON []byte, auth *cliproxyauth.Auth, headerSets ...http.Header) (*http.Request, []byte, error) {
 	doc := ojson.NewDoc(rawJSON)
-	return e.cacheHelperDoc(ctx, from, url, req, doc, auth, headerSets...)
-}
-
-func (e *CodexExecutor) cacheHelperDoc(ctx context.Context, from sdktranslator.Format, url string, req cliproxyexecutor.Request, doc *ojson.Doc, auth *cliproxyauth.Auth, headerSets ...http.Header) (*http.Request, []byte, error) {
 	var headers http.Header
 	if len(headerSets) > 0 {
 		headers = headerSets[0]
+	}
+	return e.cacheHelperDoc(ctx, from, url, req, doc, auth, headers, rawJSON)
+}
+
+func (e *CodexExecutor) cacheHelperDoc(ctx context.Context, from sdktranslator.Format, url string, req cliproxyexecutor.Request, doc *ojson.Doc, auth *cliproxyauth.Auth, headers http.Header, originalBody ...[]byte) (*http.Request, []byte, error) {
+	sourceBody := req.Payload
+	if len(originalBody) > 0 {
+		sourceBody = originalBody[0]
 	}
 	var cache helps.CodexCache
 	if sourceFormatEqual(from, sdktranslator.FormatClaude) {
@@ -202,10 +206,22 @@ func (e *CodexExecutor) cacheHelperDoc(ctx context.Context, from sdktranslator.F
 		helps.SetStringIfDifferentDoc(doc, "prompt_cache_key", cache.ID)
 	}
 	helps.SanitizeCodexInputItemIDsDoc(doc)
+	// Resolve once per attempt; compression fallback carries this same snapshot.
+	devicePolicy := e.deviceResolver.Resolve(e.cfg, auth, codexUseSIWCForRequest(ctx, auth, headers), url)
+	ctx = helps.WithCodexDevicePolicy(ctx, devicePolicy)
+	if errDevice := devicePolicy.ValidateInput(req.Payload); errDevice != nil {
+		return nil, nil, errDevice
+	}
+	if errDevice := devicePolicy.ApplyDoc(doc, false, sourceBody); errDevice != nil {
+		return nil, nil, errDevice
+	}
 	helps.FinalizePayloadDoc(ctx, doc)
 	var rawJSON []byte
 	if doc != nil {
 		rawJSON = doc.Bytes()
+	}
+	if errDevice := devicePolicy.ValidateInput(rawJSON); errDevice != nil {
+		return nil, nil, errDevice
 	}
 	if errMarker := helps.ValidateCodexSessionInstructionMarker(rawJSON, from); errMarker != nil {
 		return nil, nil, errMarker
@@ -525,6 +541,9 @@ func applyCodexHeadersFromSources(r *http.Request, auth *cliproxyauth.Auth, toke
 }
 
 func applyCodexHeadersWithSIWC(r *http.Request, auth *cliproxyauth.Auth, useSIWC bool, token string, stream bool, cfg *config.Config, ginHeaders http.Header) {
+	if policy, ok := helps.CodexDevicePolicyFromContext(r.Context()); ok && policy.Enabled {
+		useSIWC = policy.SIWC
+	}
 	r.Header.Set("Content-Type", "application/json")
 	if strings.TrimSpace(token) != "" {
 		r.Header.Set("Authorization", "Bearer "+token)
@@ -548,6 +567,9 @@ func applyCodexHeadersWithSIWC(r *http.Request, auth *cliproxyauth.Auth, useSIWC
 		var attrs map[string]string
 		if auth != nil {
 			attrs = auth.Attributes
+		}
+		if devicePolicy, ok := helps.CodexDevicePolicyFromContext(r.Context()); ok {
+			devicePolicy.ApplyHeadersFromSource(r.Header, ginHeaders)
 		}
 		util.ApplyCustomHeadersFromAttrs(r, attrs, ginHeaders)
 		return
@@ -591,6 +613,9 @@ func applyCodexHeadersWithSIWC(r *http.Request, auth *cliproxyauth.Auth, useSIWC
 	var attrs map[string]string
 	if auth != nil {
 		attrs = auth.Attributes
+	}
+	if devicePolicy, ok := helps.CodexDevicePolicyFromContext(r.Context()); ok {
+		devicePolicy.ApplyHeadersFromSource(r.Header, ginHeaders)
 	}
 	util.ApplyCustomHeadersFromAttrs(r, attrs, ginHeaders)
 	applyCodexCloakingHeaders(r.Header, cfg, auth)

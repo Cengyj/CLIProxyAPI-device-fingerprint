@@ -1261,6 +1261,15 @@ oauth:
 
     # Codex provider behavior.
     codex:
+      # Opt in to stable per-account installation IDs on Codex OAuth Responses requests.
+      # Modes: off (default), device. API-key credentials are always excluded.
+      # For gradual rollout, keep off and set codex_device_fingerprint: device in selected auth metadata.
+      # Session, thread, turn, window, and cache identifiers keep their existing behavior.
+      device-fingerprint-mode: off
+      # Only add a missing body installation field when true; SIWC and control frames never inject it.
+      # Explicit user payload/header rules retain their existing final priority.
+      device-fingerprint-inject-missing: false
+
       # Terminate and relay Codex Live WebRTC audio and DataChannel traffic in this process.
       # This requires inbound UDP reachability. Keep disabled to preserve direct media behavior.
       # On Solaris and illumos, leave this disabled: in-process media relay is unsupported.

@@ -576,7 +576,7 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 				consumedPayload = nil
 				return true
 			}
-			prepared, errPrepare := e.prepareCodexWebsocketStream(streamCtx, auth, nextReq, nextOpts, sess)
+			prepared, errPrepare := e.prepareCodexWebsocketStreamWithDevice(streamCtx, auth, nextReq, nextOpts, sess, &initial.device.policy)
 			if errPrepare != nil {
 				if cliproxyexecutor.IsUpstreamWebsocketTurnError(errPrepare) {
 					return rejectPreviousResponseNotFound(eventID)
@@ -594,7 +594,7 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 			if errConn := prepared.sessionInstructions.OnConnection(conn); errConn != nil {
 				return rejectPreviousResponseNotFound(eventID)
 			}
-			if prepared.wsURL != initial.wsURL {
+			if prepared.wsURL != initial.wsURL || prepared.useSIWC != initial.useSIWC || !sess.bindDevice(conn, prepared.device) {
 				fail(cliproxyexecutor.NewUpstreamWebsocketReplayRequiredError())
 				return false
 			}
@@ -715,15 +715,40 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 					}
 					steerDoc := ojson.NewDoc(steerReq.Payload)
 					helps.StripCodexSessionInstructionMarker(steerDoc, opts.SourceFormat)
-					if codexUseSIWCForRequest(ctx, auth, steerHeaders) {
+					if codexUseSIWCForRequest(ctx, auth, steerHeaders) != initial.useSIWC || !e.deviceResolver.CompatibleFrozenAuth(initial.device.policy, auth, initial.useSIWC, initial.wsURL) {
+						fail(cliproxyexecutor.NewUpstreamWebsocketReplayRequiredError())
+						return
+					}
+					if initial.useSIWC {
 						thinking.StripConfigurationUpdatesDoc(steerDoc)
+					}
+					boundDevice, sameConn := sess.deviceForConn(conn)
+					if !sameConn {
+						fail(cliproxyexecutor.NewUpstreamWebsocketReplayRequiredError())
+						return
+					}
+					controlPolicy := boundDevice.controlPolicy()
+					if errDevice := controlPolicy.ValidateInput(steerReq.Payload); errDevice != nil {
+						fail(errDevice)
+						return
+					}
+					if errDevice := controlPolicy.ApplyDoc(steerDoc, true, steerReq.Payload); errDevice != nil {
+						fail(errDevice)
+						return
 					}
 					steerCtx := helps.WithPayloadFinalizer(streamCtx, helps.NewPayloadFinalizer(e.cfg, "codex-websockets", thinking.ParseSuffix(req.Model).ModelName, "codex", "", steerReq.Payload, steerReq, steerOpts))
 					helps.FinalizePayloadDoc(steerCtx, steerDoc)
+					// The event discriminator is transport framing; device fields
+					// have already passed through the final business payload rules.
 					_ = steerDoc.Set("type", "response.steer")
+					steerDevice := codexWebsocketDeviceSnapshot{policy: initial.device.policy, identity: initial.device.policy.Identity(steerDoc, initial.wsHeaders)}
 					parent := strings.Clone(steerDoc.Get("previous_response_id").String())
 					steerEventID := strings.Clone(steerDoc.Get("event_id").String())
 					payload = steerDoc.Bytes()
+					if errDevice := controlPolicy.ValidateInput(payload); errDevice != nil {
+						fail(errDevice)
+						return
+					}
 					if errMarker := helps.ValidateCodexSessionInstructionMarker(payload, opts.SourceFormat); errMarker != nil {
 						if !reject(errMarker.Error()) {
 							return
@@ -746,6 +771,10 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 							return
 						}
 						continue
+					}
+					if !sess.bindDevice(conn, steerDevice) {
+						fail(cliproxyexecutor.NewUpstreamWebsocketReplayRequiredError())
+						return
 					}
 					metadataMu.Lock()
 					unacknowledgedSteers = append(unacknowledgedSteers, codexSteerSubmission{parent: parent, eventID: steerEventID})

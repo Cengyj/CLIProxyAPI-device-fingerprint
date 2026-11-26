@@ -327,6 +327,12 @@ func (c ResponseCompressionConfig) EffectiveMinBytes() int {
 
 // CodexConfig configures provider-wide Codex request behavior.
 type CodexConfig struct {
+	// DeviceFingerprintMode opts Codex OAuth Responses requests into installation ID convergence.
+	// Only "device" enables it (case-insensitive, ignoring surrounding whitespace); all other values disable it.
+	DeviceFingerprintMode string `yaml:"device-fingerprint-mode,omitempty" json:"device-fingerprint-mode,omitempty"`
+	// DeviceFingerprintInjectMissing adds a missing installation field only on non-SIWC business requests.
+	// Omitted and false both disable injection; the pointer preserves explicit configuration intent.
+	DeviceFingerprintInjectMissing *bool `yaml:"device-fingerprint-inject-missing,omitempty" json:"device-fingerprint-inject-missing,omitempty"`
 	// WebsocketCompression controls upstream and downstream permessage-deflate; unset means enabled.
 	WebsocketCompression *bool `yaml:"websocket-compression,omitempty" json:"websocket-compression,omitempty"`
 	// UpstreamRequestCompression enables zstd request bodies for the ChatGPT Codex backend.

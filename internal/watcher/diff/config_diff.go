@@ -161,6 +161,10 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 		changes = append(changes, fmt.Sprintf("antigravity.connection-pool.max-idle-conns-per-host: %s -> %s", oldMaxIdle, newMaxIdle))
 	}
 
+	if oldCfg.Codex.DeviceFingerprintMode != newCfg.Codex.DeviceFingerprintMode {
+		changes = append(changes, fmt.Sprintf("oauth.providers.codex.device-fingerprint-mode: %s -> %s", displayCodexDeviceFingerprintMode(oldCfg.Codex.DeviceFingerprintMode), displayCodexDeviceFingerprintMode(newCfg.Codex.DeviceFingerprintMode)))
+	}
+	changes = appendOptionalBoolChange(changes, "oauth.providers.codex.device-fingerprint-inject-missing", oldCfg.Codex.DeviceFingerprintInjectMissing, newCfg.Codex.DeviceFingerprintInjectMissing)
 	if oldCfg.Codex.DisableCodexCloaking != newCfg.Codex.DisableCodexCloaking {
 		changes = append(changes, fmt.Sprintf("codex.disable-codex-cloaking: %t -> %t", oldCfg.Codex.DisableCodexCloaking, newCfg.Codex.DisableCodexCloaking))
 	}
@@ -691,6 +695,18 @@ func appendOptionalIntChange(changes []string, field string, oldVal, newVal *int
 		return changes
 	}
 	return append(changes, fmt.Sprintf("%s: %s -> %s", field, formatOptionalInt(oldVal), formatOptionalInt(newVal)))
+}
+
+// displayCodexDeviceFingerprintMode never logs an unknown value supplied in configuration.
+func displayCodexDeviceFingerprintMode(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "device":
+		return "device"
+	case "", "off":
+		return "off"
+	default:
+		return "off (invalid)"
+	}
 }
 
 func appendOptionalBoolChange(changes []string, field string, oldVal, newVal *bool) []string {

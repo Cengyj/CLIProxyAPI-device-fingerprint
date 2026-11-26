@@ -145,12 +145,23 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		sess = newEphemeralCodexWebsocketSession()
 	}
 
-	sessionInstructions, errSession := e.prepareSessionInstructions(ctx, doc, auth, req, opts, sess, wsURL, useSIWC)
+	devicePolicy := e.deviceResolver.Resolve(e.cfg, auth, useSIWC, httpURL)
+	ctx = helps.WithCodexDevicePolicy(ctx, devicePolicy)
+	if errDevice := devicePolicy.ValidateInput(req.Payload); errDevice != nil {
+		return resp, errDevice
+	}
+	if errDevice := devicePolicy.ApplyDoc(doc, false, body); errDevice != nil {
+		return resp, errDevice
+	}
+	sessionInstructions, errSession := e.prepareSessionInstructions(ctx, doc, auth, req, opts, sess, wsURL, useSIWC, devicePolicy)
 	if errSession != nil {
 		return resp, errSession
 	}
 	helps.FinalizePayloadDoc(ctx, doc)
 	body = doc.Bytes()
+	if errDevice := devicePolicy.ValidateInput(body); errDevice != nil {
+		return resp, errDevice
+	}
 	if errMarker := helps.ValidateCodexSessionInstructionMarker(body, from); errMarker != nil {
 		return resp, errMarker
 	}
@@ -165,6 +176,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	wsHeaders = applyCodexWebsocketHeaders(ctx, wsHeaders, auth, apiKey, e.cfg, nativeRequest, opts.Headers)
 	applyCodexRoutingHint(ctx, wsHeaders, auth, upstreamModel, body, opts.Headers)
 	applyModelHeaderOverrides(wsHeaders, upstreamModel)
+	device := codexWebsocketDeviceSnapshot{policy: devicePolicy, identity: devicePolicy.Identity(doc, wsHeaders)}
 	if errValidate := helps.ValidateCodexHostedImageGenerationDoc(doc, wsHeaders, e.cfg, !useSIWC && !codexAuthUsesAPIKey(auth)); errValidate != nil {
 		return resp, errValidate
 	}
@@ -195,8 +207,9 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	var respHS *http.Response
 	var errDial error
 	dialCtx := ctx
-	if cliproxyexecutor.RequiredUpstreamWebsocket(ctx) || sessionInstructions.ConnectionBound() {
-		conn, closer = existingWebsocketSessionConn(sess, authID, wsURL, executionProxyURL(ctx, sess.effectiveConfig(authID, e.cfg), auth), useSIWC)
+	deviceConnectionBound := (devicePolicy.Enabled || sess.hasDevicePolicy()) && strings.TrimSpace(doc.Get("previous_response_id").String()) != ""
+	if cliproxyexecutor.RequiredUpstreamWebsocket(ctx) || sessionInstructions.ConnectionBound() || deviceConnectionBound {
+		conn, closer = existingCodexWebsocketSessionConn(sess, authID, wsURL, executionProxyURL(ctx, sess.effectiveConfig(authID, e.cfg), auth), useSIWC, device)
 		if conn == nil {
 			if errConn := sessionInstructions.OnConnection(nil); errConn != nil {
 				return resp, errConn
@@ -205,7 +218,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		}
 	} else {
 		dialCtx = cliproxyexecutor.WithUpstreamAttemptTracker(ctx)
-		conn, closer, respHS, errDial = e.ensureUpstreamConnWithSIWC(dialCtx, auth, sess, authID, wsURL, wsHeaders, useSIWC)
+		conn, closer, respHS, errDial = e.ensureUpstreamConnWithSIWC(dialCtx, auth, sess, authID, wsURL, wsHeaders, useSIWC, device)
 	}
 	if errDial != nil {
 		bodyErr := recordWebsocketDialFailure(ctx, e.cfg, wsReqLog, respHS, errDial)
@@ -225,6 +238,9 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 			return resp, newCodexStatusErrWithHeadersAndCooling(respHS.StatusCode, respHS.Header, bodyErr, e.modelLevelCooling())
 		}
 		return resp, errDial
+	}
+	if !sess.bindDevice(conn, device) {
+		return resp, cliproxyexecutor.NewUpstreamWebsocketReplayRequiredError()
 	}
 	if errConn := sessionInstructions.OnConnection(conn); errConn != nil {
 		return resp, errConn
@@ -260,7 +276,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	if errSend := writeCodexWebsocketMessage(sess, conn, wsReqBody); errSend != nil {
 		errSend = mapCodexWebsocketWriteError(sess, conn, errSend)
 		if sess != nil && !isEphemeralSession {
-			if cliproxyexecutor.RequiredUpstreamWebsocket(ctx) {
+			if cliproxyexecutor.RequiredUpstreamWebsocket(ctx) || deviceConnectionBound {
 				e.invalidateUpstreamConnWithoutDisconnectNotify(sess, conn, "send_error", errSend)
 				if !shouldRetryCodexWebsocketSend(errSend) {
 					helps.RecordAPIWebsocketError(ctx, e.cfg, "send", errSend)
@@ -281,7 +297,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 			// Retry once with a fresh websocket connection. This is mainly to handle
 			// upstream closing the socket between sequential requests within the same
 			// execution session.
-			connRetry, closerRetry, respHSRetry, errDialRetry := e.ensureUpstreamConnWithSIWC(ctx, auth, sess, authID, wsURL, wsHeaders, useSIWC)
+			connRetry, closerRetry, respHSRetry, errDialRetry := e.ensureUpstreamConnWithSIWC(ctx, auth, sess, authID, wsURL, wsHeaders, useSIWC, device)
 			if errDialRetry == nil && connRetry != nil {
 				previousConn, previousReadCh := conn, readCh
 				conn = connRetry

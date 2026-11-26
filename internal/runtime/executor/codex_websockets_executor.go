@@ -231,6 +231,8 @@ func (e *CodexWebsocketsExecutor) InterruptExecutionSession(ctx context.Context,
 		sess.connMu.Unlock()
 		return cliproxyexecutor.ErrNoActiveUpstreamWebsocket
 	}
+	device := sess.device
+	devicePolicy := device.controlPolicy()
 	sess.activeMu.Lock()
 	targetID := ojson.GetBytesNoCopy(payload, "response_id").String()
 	_, alreadyTerminal := sess.terminalResponseIDs[targetID]
@@ -275,9 +277,20 @@ func (e *CodexWebsocketsExecutor) InterruptExecutionSession(ctx context.Context,
 	if ojson.GetBytesNoCopy(payload, "client_metadata").Exists() {
 		doc := ojson.NewDoc(payload)
 		helps.StripCodexSessionInstructionMarker(doc, sdktranslator.FormatOpenAIResponse)
+		if errDevice := devicePolicy.ValidateInput(payload); errDevice != nil {
+			return errDevice
+		}
+		if errDevice := devicePolicy.ApplyDoc(doc, true, payload); errDevice != nil {
+			return errDevice
+		}
 		payload = doc.Bytes()
 		if errMarker := helps.ValidateCodexSessionInstructionMarker(payload, sdktranslator.FormatOpenAIResponse); errMarker != nil {
 			return errMarker
+		}
+		// Recheck current connection identity after preparing the control frame,
+		// and remember fields first presented by this interrupt for future reuse.
+		if !sess.bindDevice(conn, codexWebsocketDeviceSnapshot{policy: device.policy, identity: devicePolicy.Identity(doc, nil)}) {
+			return cliproxyexecutor.NewUpstreamWebsocketReplayRequiredError()
 		}
 	}
 	if errWrite := writeCodexWebsocketMessage(sess, conn, payload); errWrite != nil {
