@@ -113,6 +113,17 @@ Selection order:
 
 The parser is used only for existing credential metadata, not a new authentication
 protocol. Missing plan claims are not treated as the parser's default `free`.
+The internal `plan_type_defaulted` marker preserves this distinction through local
+OAuth exchange/refresh, login storage, refresh receipts, file saves and synthesis.
+It does not change the default `free` seen by existing catalog/scheduling code.
+The marker belongs to its own Attributes or Metadata source; an explicit `free`
+without a true marker remains a real plan transition. Explicit false clears an
+older default marker. Legacy files/receipts that already contain `free` without
+provenance are inherently ambiguous and are treated as explicit. Do not edit this
+internal marker as a device-mode setting. A separately versioned Home credential
+producer must preserve the same provenance; that remote producer was not available
+for validation in this checkout. Use an explicit installation override when its
+missing-plan recovery cannot be established.
 A token associated with a different account cannot supply its old member/plan.
 The current `Metadata.id_token` takes precedence over an auxiliary
 `Attributes.id_token`, matching OAuth refresh persistence; mode and explicit
@@ -138,7 +149,8 @@ compact forms, nil IDs and other versions are rejected.
 
 Normal account-derived IDs survive token refresh, email removal, credential object
 replacement, file renaming and process restart when account identity is unchanged.
-Each executor retains at most 512 recent identity hints in a mutex-protected LRU;
+Each automatic Codex executor shares at most 512 recent identity hints between
+its HTTP and WS implementations in a mutex-protected LRU;
 there are no token caches, background workers, database changes or per-request
 credential writes. Hints fill temporarily missing fields only for a compatible
 account, and cannot mix a new account with the previous account's user/plan.
@@ -149,8 +161,9 @@ Warnings are bounded by reason per executor and contain no account, user, email,
 JWT, token or full device value.
 
 Fallback IDs can change when an account becomes known, an auth ID changes, or
-missing-field hints are evicted/lost on restart. Independent instances derive the
-same ID from the same complete identity; they do not share hints. Use an explicit
+missing-field hints are evicted/lost on restart. Independent instances (including
+separately constructed HTTP/WS executors) derive the same ID from the same complete
+identity; they do not share hints. Use an explicit
 ID when permanent cross-environment pinning is required.
 
 ## Final administrator rules and WebSockets
@@ -179,6 +192,9 @@ public UUID or filters all device fields. It does not change public UUID derivat
 or make shared administrator UUIDs automatically isolated. If metadata cannot
 reveal a subject change, the guard cannot infer one from unchanged auth/device IDs. It ignores turn/session/thread/cache fields.
 Missing device fields impose no new identity and do not generate random reconnects.
+Removing a configured handshake header does not unsend it on a retained socket;
+the next fresh handshake omits it. End the session/restart to require immediate
+removal from all physical connections.
 A newly requested device handshake header requires a new handshake: an ordinary
 complete request reconnects; a continuation or active duplex requests replay.
 Candidate headers are never remembered as sent when the socket was merely reused.
@@ -199,6 +215,9 @@ control fields, and does not acquire ordinary payload rules. Device values first
 presented by an interrupt are bound under the connection lock before sending,
 so later business frames cannot silently adopt a different identity. Ambiguous configured
 control identities are rejected rather than sent on an incompatible connection.
+An independent duplex local-summary HTTP request resolves its own attempt policy;
+its synthetic-parent append returns to the frozen WS policy and still passes the
+final business barrier. An incompatible new explicit identity requires replay.
 A failed interrupt write retires the enabled socket and clears device state,
 because a partial frame may already have exposed its identity.
 Connection detach, invalidate, close and competing dial paths clear device state
@@ -264,6 +283,11 @@ controls. Helper files live in `helps/`, not alongside executor implementations.
 | `.gitignore` | Allow this maintenance document to be versioned under the existing ignored `docs/` directory. |
 | `config.example.yaml` / `oauth.providers.codex` | Describe defaults and opt-in behavior without changing real configuration. |
 | `internal/config/config_types.go` / `CodexConfig` | Add mode string and optional inject boolean. Keep automatic OAuth mapping; do not move them under shared upstream settings. |
+| `internal/config/config_yaml.go` / `renderConfigSave`, `isKnownDefaultValue` | Preserve newly added explicit inject false and its provider mapping; remove the saved field when the optional value returns to nil. |
+| `internal/watcher/synthesizer/file.go` / `synthesizeFileAuths` | Label parser-defaulted free in synthesized attributes while preserving existing plan defaults and explicit values. |
+| `internal/auth/codex/openai.go`, `token.go` / token data, storage and outer credential allowlist; `openai_auth.go` / exchange, refresh, storage creation/update; `refresh_journal.go` / `decodeRefreshReceipt` | Carry source provenance with refreshed credentials, including false to clear prior true; never substitute a token-derived default for an explicit plan. |
+| `sdk/auth/codex_device.go` / `buildAuthRecord` | Copy plan provenance to initial login storage, Metadata and Attributes; raw explicit token plans clear defaulted provenance. |
+| `internal/runtime/executor/codex_executor_auth.go` / `refreshLocked` | Preserve plan provenance through refresh/save; adopting rotated disk credentials clears stale plan/source fields and synchronizes attributes. |
 | `internal/watcher/diff/config_diff.go` / `BuildConfigChangeDetails` | Expose hot reload changes using bounded/sanitized mode descriptions and optional boolean values, with no device/account data. |
 | `internal/runtime/executor/codex_executor.go` / `CodexExecutor`, `NewCodexExecutor` | Own bounded resolver state for the executor lifetime, never a global current ID. |
 | `internal/runtime/executor/codex_executor_request.go` / `cacheHelper`, `cacheHelperDoc` | Resolve selected auth/route once, validate ambiguity, mutate the same Doc before `FinalizePayloadDoc`; carry snapshot on the resulting request context through compression fallback. |
@@ -274,6 +298,7 @@ controls. Helper files live in `helps/`, not alongside executor implementations.
 | `internal/runtime/executor/codex_websockets_request.go` / `prepareSessionInstructions`, `applyCodexWebsocketHeaders` | Exclude incompatible connection proof using one locked target/device snapshot, without a second off-mode transport check; check final identity before sending, and process both handshake branches before administrator header overrides. |
 | `internal/runtime/executor/codex_websockets_session.go` / `codexWebsocketSession`, device binding/reuse helpers, `ensureUpstreamConnWithSIWC`, detach/invalidate/close | Physical identity is protected by `connMu`. Install/clear it with the connection; no lock held across dial or auth-manager work, and no stale state after losing a dial race. Require a new handshake for newly requested device headers; omitted candidate headers remain unconstrained. Shared transport users keep existing behavior. |
 | `internal/runtime/executor/codex_websockets_duplex.go` / `streamCodexDuplex` | Freeze the actual physical socket policy for create/append, including a reused initial connection; reject candidate handshake changes. Steer changes existing fields before final business rules, and only its body contributes new observed identity; validate compatibility without modifying final values. |
+| `internal/runtime/executor/codex_websockets_executor.go` / `NewCodexAutoExecutor` | Share the bounded resolver between HTTP and WS for this executor lifetime, so transport selection does not lose temporary identity hints. |
 | `internal/runtime/executor/codex_websockets_executor.go` / `InterruptExecutionSession` | Read target policy inside existing connection-pointer/state checks; only existing fields, no ordinary business payload rules; reject incompatible control identity. Invalidate an enabled socket after a failed control write to clear uncertain bindings. |
 
 Independent implementation files:
@@ -282,8 +307,8 @@ Independent implementation files:
   policy, bounded state, UUID/claims selection, private credential subject binding,
   local Doc/header handling, final effective identity compatibility.
 - `internal/runtime/executor/helps/codex_device_fingerprint_connection.go`: complete
-  source header forwarding, handshake compatibility and identity checks against a
-  frozen duplex policy.
+  source header forwarding with deterministic case-variant ordering on retries,
+  handshake compatibility and identity checks against a frozen duplex policy.
 - `internal/runtime/executor/helps/codex_device_fingerprint_test.go`: identity,
   golden vectors, shapes/duplicates/precision, scope, state bounds and concurrency.
 - `internal/runtime/executor/codex_device_fingerprint_test.go`: HTTP wire captures,
@@ -302,12 +327,27 @@ Independent implementation files:
   refresh/save preservation and administrator edits.
 - `internal/config/codex_device_fingerprint_test.go` and
   `internal/watcher/diff/codex_device_fingerprint_test.go`: mapping, migration,
-  snapshots, scope, defaults and change visibility.
+  snapshots, scope, defaults and change visibility, including optional injection
+  save transitions.
+- `internal/runtime/executor/codex_device_fingerprint_acceptance_http_test.go`: real
+  translation paths, cross-transport hints, compression 400/415 multivalue retries,
+  Manager request-error isolation, inherited scope and JSON wire edge cases.
+- `internal/runtime/executor/codex_device_fingerprint_acceptance_ws_test.go`: actual
+  handshake transitions, competing dials, stale lifecycle callbacks, local summary,
+  create/append/steer/interrupt, bind failure and concurrent interrupt/close.
+- `internal/runtime/executor/helps/codex_device_fingerprint_plan_test.go`,
+  `internal/watcher/synthesizer/codex_device_fingerprint_plan_test.go`,
+  `internal/auth/codex/codex_device_fingerprint_plan_test.go`, and
+  `sdk/auth/codex_device_fingerprint_test.go`: plan source precedence, real
+  synthesis, login/storage, OAuth, journal, eviction and reconstruction.
+- `sdk/cliproxy/codex_device_fingerprint_test.go`: real file save/migration, watcher
+  reload/dispatch, Service executor replacement and Manager HTTP/WS captures.
+  It synchronizes on the production reload/queue path, not fsnotify debounce timing.
 
 Inspected but intentionally unchanged: `config_v8.go`, `oauth_scope.go`,
 `oauth_scope_executor.go` (API-key views share a resolver pointer instead of copying
 a mutex), `codex_executor_tokens.go` (local CountTokens), `helps/payload_finalizer.go`,
-`helps/codex_session_instructions.go`, `codex_executor_auth.go`, and
+`helps/codex_session_instructions.go`, and
 `sdk/cliproxy/auth/codex_persist.go`. Upgrade review must revisit these dependencies
 as well as changed files, especially if a request path stops using the shared
 builder or moves the final barrier.
@@ -328,7 +368,7 @@ git remote -v
 git fetch upstream --tags
 git show --no-patch --format=fuller <chosen-official-tag-or-commit>
 git switch -c <new-upgrade-candidate> <chosen-official-tag-or-commit>
-git cherry-pick <feature-code-commit> <maintenance-document-commit> <review-fix-commit> <review-document-commit>
+git cherry-pick <feature-code-commit> <maintenance-document-commit> <review-fix-commit> <review-document-commit> <acceptance-fix-commit> <acceptance-document-commit>
 ```
 
 Resolve conflicts semantically and inspect every integration point. Never use
@@ -364,7 +404,9 @@ go test -mod=readonly ./internal/config ./internal/watcher/diff ./internal/runti
 go test -mod=readonly ./internal/runtime/executor/helps ./internal/runtime/executor -run '^(TestPayloadRulesMatchFinalBodyAndTrackPaths|TestFinalizePayloadDocCrossMethodPipeline|TestCodexSessionInstructionsHTTP|TestCodexSessionInstructionsWebsocket|TestCodexDuplexSteerPayloadBarrier)$' -count=1
 go test -mod=readonly ./internal/config ./internal/watcher/diff ./internal/runtime/executor/helps ./internal/runtime/executor -count=1
 go test -mod=readonly -race ./internal/runtime/executor/helps ./internal/runtime/executor -run 'CodexDeviceFingerprint' -count=1
-go vet ./internal/config ./internal/watcher/diff ./internal/runtime/executor/helps ./internal/runtime/executor
+go test -mod=readonly ./internal/auth/codex ./internal/watcher/synthesizer ./sdk/auth ./sdk/cliproxy ./sdk/cliproxy/auth -count=1
+go test -mod=readonly -race ./internal/auth/codex ./internal/watcher/synthesizer ./sdk/auth ./sdk/cliproxy -run CodexDeviceFingerprint -count=1
+go vet ./internal/config ./internal/watcher/diff ./internal/runtime/executor/helps ./internal/runtime/executor ./internal/auth/codex ./internal/watcher/synthesizer ./sdk/auth ./sdk/cliproxy
 go test -mod=readonly ./...
 go build -o test-output ./cmd/server && rm test-output
 git diff --check
@@ -570,3 +612,42 @@ Review logs are in `/tmp/codex-device-strict-review/`: `feature-confirmation.log
 `ws-off-followup-loss300.log`, and `off-parity-result.txt`. Earlier failed runs
 (`full-final.log`, `packages-delivery.log`) remain available for comparison.
 These temporary files are review evidence, not dependencies of the patch.
+
+## Acceptance follow-up (2026-11-26)
+
+Apply these after the four original and strict-review commits:
+
+5. `eb9ec2a5dd0cbeb5c84146a60a10fe3cea5f7506` — preserve plan provenance and
+   transport identity hints, retain optional injection settings on save, stabilize
+   multivalue header retries, and add loading/refresh/Service/wire regressions.
+6. Resolve the accompanying maintenance-document commit with
+   `git log -1 --format=%H -- docs/codex-device-fingerprint.md`.
+
+Final source has 79 top-level `TestCodexDeviceFingerprint*` tests (25 added in this
+follow-up), plus table-driven cases. Required feature selections, five named
+payload/session barriers, complete config/diff/helpers/executor packages,
+additional auth/synthesis/SDK/Service/Manager packages, extended feature race,
+vet, `go test -mod=readonly ./...`, server build and `git diff --check` passed.
+No final acceptance failure or environment block occurred. Earlier observations
+above are historical records, not failures of this final source.
+
+A fresh same-environment comparison captured identical final body bytes and
+header maps for disabled HTTP Execute, ExecuteStream and compact against the
+official baseline. All 2,670 baseline tracked file hashes were checked again;
+temporary comparison probes were removed. The original directory was not changed.
+
+Evidence is in `/tmp/codex-device-acceptance/`: `final-test-inventory.log`,
+`final-feature.log`, `final-feature-extra.log`, `final-barriers.log`,
+`final-packages.log`, `final-packages-extra.log`, `final-race.log`, `final-vet.log`,
+`final-full.log`, and `final-off-parity.txt`. These local logs are supporting
+artifacts, not build inputs. No separate audit document was added to the repository.
+
+Tests use synthetic credentials and local upstreams. Running-program/configuration
+enablement, production accounts, remote Home credential producers, fsnotify
+debounce timing, live media exchange and external billing are not established by
+these tests. Alpha/search, Live and management api-call retain their existing
+non-Responses paths; device route guards and inherited-context exclusion are
+tested without expanding these routes. Passing repository regressions does not
+mean every excluded protocol was exercised against a real upstream. The feature
+remains off by default; no deployment, real credential/configuration modification,
+dependency change or remote write was performed.
