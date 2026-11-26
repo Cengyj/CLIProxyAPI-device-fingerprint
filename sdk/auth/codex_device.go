@@ -267,6 +267,7 @@ func (a *CodexAuthenticator) buildAuthRecord(authSvc *codex.CodexAuth, authBundl
 		if claims, errParse := codex.ParseJWTToken(tokenStorage.IDToken); errParse == nil && claims != nil {
 			if pt := strings.TrimSpace(claims.CodexAuthInfo.ChatgptPlanType); pt != "" {
 				planType = pt
+				tokenStorage.PlanTypeDefaulted = false
 			}
 			accountID := strings.TrimSpace(claims.CodexAuthInfo.ChatgptAccountID)
 			if accountID != "" {
@@ -277,13 +278,15 @@ func (a *CodexAuthenticator) buildAuthRecord(authSvc *codex.CodexAuth, authBundl
 	}
 	if planType == "" {
 		planType = codex.DefaultPlanType
+		tokenStorage.PlanTypeDefaulted = true
 	}
 	tokenStorage.PlanType = planType
 
 	fileName := codex.CredentialFileName(tokenStorage.Email, planType, hashAccountID, true)
 	metadata := map[string]any{
-		"email":     tokenStorage.Email,
-		"plan_type": planType,
+		"email":               tokenStorage.Email,
+		"plan_type":           planType,
+		"plan_type_defaulted": tokenStorage.PlanTypeDefaulted,
 	}
 
 	fmt.Println("Codex authentication successful")
@@ -298,7 +301,8 @@ func (a *CodexAuthenticator) buildAuthRecord(authSvc *codex.CodexAuth, authBundl
 		Storage:  tokenStorage,
 		Metadata: metadata,
 		Attributes: map[string]string{
-			"plan_type": planType,
+			"plan_type":           planType,
+			"plan_type_defaulted": strconv.FormatBool(tokenStorage.PlanTypeDefaulted),
 		},
 	}, nil
 }

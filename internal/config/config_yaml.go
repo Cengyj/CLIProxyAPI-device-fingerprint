@@ -99,6 +99,9 @@ func renderConfigSave(data []byte, persistCfg *Config, migrating bool) ([]byte, 
 	if persistCfg != nil && persistCfg.Claude.OAuthIncludeCreateAPIKey == nil {
 		deleteYAMLPath(original.Content[0], "claude.oauth-include-create-api-key")
 	}
+	if persistCfg != nil && persistCfg.Codex.DeviceFingerprintInjectMissing == nil {
+		deleteYAMLPath(original.Content[0], "codex.device-fingerprint-inject-missing")
+	}
 
 	// Merge generated into original in-place, preserving comments/order of existing nodes.
 	mergeMappingPreserve(original.Content[0], generated.Content[0])
@@ -468,19 +471,21 @@ func isKnownDefaultValue(path []string, node *yaml.Node) bool {
 		return false
 	}
 
-	// Pointer-backed booleans (such as cache-user-id, disable-cooling, and oauth-include-create-api-key): explicit values are meaningful and must be preserved.
-	if len(path) > 0 && (path[len(path)-1] == "cache-user-id" || path[len(path)-1] == "disable-cooling" || path[len(path)-1] == "oauth-include-create-api-key") && node != nil && node.Kind == yaml.ScalarNode && node.Tag == "!!bool" {
+	// Pointer-backed booleans: explicit values are meaningful and must be preserved.
+	if len(path) > 0 && (path[len(path)-1] == "cache-user-id" || path[len(path)-1] == "disable-cooling" || path[len(path)-1] == "oauth-include-create-api-key" || path[len(path)-1] == "device-fingerprint-inject-missing") && node != nil && node.Kind == yaml.ScalarNode && node.Tag == "!!bool" {
 		return false
 	}
 
-	// A parent mapping carrying an explicit session-date-pin-days or
-	// oauth-include-create-api-key value must survive the zero-value check below,
-	// or the new key is never written.
+	// A parent mapping carrying an explicit optional value must survive the
+	// zero-value check below, or the new key is never written.
 	if node != nil && node.Kind == yaml.MappingNode {
 		if pinIdx := findMapKeyIndex(node, "session-date-pin-days"); pinIdx >= 0 {
 			return false
 		}
 		if scopeIdx := findMapKeyIndex(node, "oauth-include-create-api-key"); scopeIdx >= 0 {
+			return false
+		}
+		if injectIdx := findMapKeyIndex(node, "device-fingerprint-inject-missing"); injectIdx >= 0 {
 			return false
 		}
 	}

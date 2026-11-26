@@ -152,3 +152,42 @@ func TestCodexDeviceFingerprintConfigV8PrecedenceAndExample(t *testing.T) {
 		t.Fatal("device configuration must not be accepted under upstream.codex")
 	}
 }
+
+func TestCodexDeviceFingerprintConfigSaveNewOptionalInjection(t *testing.T) {
+	for _, layout := range []struct {
+		name string
+		raw  string
+	}{
+		{name: "absent provider", raw: "port: 8317\n"},
+		{name: "legacy", raw: "port: 8317\ncodex: {device-fingerprint-mode: off}\n"},
+		{name: "v8", raw: "server: {port: 8317}\noauth: {providers: {codex: {device-fingerprint-mode: off}}}\n"},
+	} {
+		t.Run(layout.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			if errWrite := os.WriteFile(path, []byte(layout.raw), 0o600); errWrite != nil {
+				t.Fatal(errWrite)
+			}
+			cfg, errLoad := LoadConfig(path)
+			if errLoad != nil {
+				t.Fatal(errLoad)
+			}
+			for _, inject := range []*bool{new(false), new(true), nil, new(false)} {
+				cfg.Codex.DeviceFingerprintInjectMissing = inject
+				if errSave := SaveConfigPreserveComments(path, cfg, true); errSave != nil {
+					t.Fatal(errSave)
+				}
+				loaded, errReload := LoadConfig(path)
+				if errReload != nil {
+					t.Fatal(errReload)
+				}
+				if !reflect.DeepEqual(loaded.Codex.DeviceFingerprintInjectMissing, inject) {
+					t.Fatalf("save/reload changed optional injection: got %v want %v", loaded.Codex.DeviceFingerprintInjectMissing, inject)
+				}
+				if loaded.ForAPIKey().Codex.DeviceFingerprintInjectMissing != nil {
+					t.Fatal("saved optional injection leaked into API-key scope")
+				}
+				cfg = loaded
+			}
+		})
+	}
+}

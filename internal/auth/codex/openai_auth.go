@@ -173,21 +173,24 @@ func (o *CodexAuth) ExchangeCodeForTokensWithRedirect(ctx context.Context, code,
 	accountID := ""
 	email := ""
 	planType := DefaultPlanType
+	planTypeDefaulted := true
 	if claims != nil {
 		accountID = claims.GetAccountID()
 		email = claims.GetUserEmail()
 		planType = claims.GetPlanType()
+		planTypeDefaulted = strings.TrimSpace(claims.CodexAuthInfo.ChatgptPlanType) == ""
 	}
 
 	// Create token data
 	tokenData := CodexTokenData{
-		IDToken:      tokenResp.IDToken,
-		AccessToken:  tokenResp.AccessToken,
-		RefreshToken: tokenResp.RefreshToken,
-		AccountID:    accountID,
-		Email:        email,
-		PlanType:     planType,
-		Expire:       time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second).Format(time.RFC3339),
+		IDToken:           tokenResp.IDToken,
+		AccessToken:       tokenResp.AccessToken,
+		RefreshToken:      tokenResp.RefreshToken,
+		AccountID:         accountID,
+		Email:             email,
+		PlanType:          planType,
+		PlanTypeDefaulted: planTypeDefaulted,
+		Expire:            time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second).Format(time.RFC3339),
 	}
 
 	// Create auth bundle
@@ -298,20 +301,23 @@ func (o *CodexAuth) refreshTokensSingleFlight(ctx context.Context, refreshToken 
 	accountID := ""
 	email := ""
 	planType := DefaultPlanType
+	planTypeDefaulted := true
 	if claims != nil {
 		accountID = claims.GetAccountID()
 		email = claims.Email
 		planType = claims.GetPlanType()
+		planTypeDefaulted = strings.TrimSpace(claims.CodexAuthInfo.ChatgptPlanType) == ""
 	}
 
 	return &CodexTokenData{
-		IDToken:      tokenResp.IDToken,
-		AccessToken:  tokenResp.AccessToken,
-		RefreshToken: tokenResp.RefreshToken,
-		AccountID:    accountID,
-		Email:        email,
-		PlanType:     planType,
-		Expire:       time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second).Format(time.RFC3339),
+		IDToken:           tokenResp.IDToken,
+		AccessToken:       tokenResp.AccessToken,
+		RefreshToken:      tokenResp.RefreshToken,
+		AccountID:         accountID,
+		Email:             email,
+		PlanType:          planType,
+		PlanTypeDefaulted: planTypeDefaulted,
+		Expire:            time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second).Format(time.RFC3339),
 	}, nil
 }
 
@@ -319,18 +325,20 @@ func (o *CodexAuth) refreshTokensSingleFlight(ctx context.Context, refreshToken 
 // It populates the storage struct with token data, user information, and timestamps.
 func (o *CodexAuth) CreateTokenStorage(bundle *CodexAuthBundle) *CodexTokenStorage {
 	planType := DefaultPlanType
+	planTypeDefaulted := bundle == nil || bundle.TokenData.PlanTypeDefaulted || strings.TrimSpace(bundle.TokenData.PlanType) == ""
 	if bundle != nil && strings.TrimSpace(bundle.TokenData.PlanType) != "" {
 		planType = strings.TrimSpace(bundle.TokenData.PlanType)
 	}
 	storage := &CodexTokenStorage{
-		IDToken:      bundle.TokenData.IDToken,
-		AccessToken:  bundle.TokenData.AccessToken,
-		RefreshToken: bundle.TokenData.RefreshToken,
-		AccountID:    bundle.TokenData.AccountID,
-		LastRefresh:  bundle.LastRefresh,
-		Email:        bundle.TokenData.Email,
-		Expire:       bundle.TokenData.Expire,
-		PlanType:     planType,
+		IDToken:           bundle.TokenData.IDToken,
+		AccessToken:       bundle.TokenData.AccessToken,
+		RefreshToken:      bundle.TokenData.RefreshToken,
+		AccountID:         bundle.TokenData.AccountID,
+		LastRefresh:       bundle.LastRefresh,
+		Email:             bundle.TokenData.Email,
+		Expire:            bundle.TokenData.Expire,
+		PlanType:          planType,
+		PlanTypeDefaulted: planTypeDefaulted,
 	}
 
 	return storage
@@ -418,4 +426,5 @@ func (o *CodexAuth) UpdateTokenStorage(storage *CodexTokenStorage, tokenData *Co
 		planType = strings.TrimSpace(tokenData.PlanType)
 	}
 	storage.PlanType = planType
+	storage.PlanTypeDefaulted = tokenData.PlanTypeDefaulted || strings.TrimSpace(tokenData.PlanType) == ""
 }

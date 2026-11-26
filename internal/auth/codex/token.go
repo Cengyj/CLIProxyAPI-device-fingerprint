@@ -116,6 +116,7 @@ var codexOuterCredentialKeys = []string{
 	"email",
 	"expired",
 	"plan_type",
+	"plan_type_defaulted",
 }
 
 func cloneStringAnyMap(src map[string]any) map[string]any {
@@ -255,6 +256,8 @@ type CodexTokenStorage struct {
 	Expire string `json:"expired"`
 	// PlanType indicates the ChatGPT subscription plan type, defaults to "free" if not present.
 	PlanType string `json:"plan_type,omitempty"`
+	// PlanTypeDefaulted distinguishes an absent claim from an explicit free plan.
+	PlanTypeDefaulted bool `json:"plan_type_defaulted"`
 	// UseSIWC controls whether API requests use the Sign in with ChatGPT (SIWC) credential section.
 	UseSIWC *bool `json:"use_siwc,omitempty"`
 	// SIWC holds the Sign in with ChatGPT OAuth credential fields.

@@ -327,11 +327,16 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) ([
 	if provider == "codex" {
 		if ptRaw, ok := metadata["plan_type"].(string); ok && strings.TrimSpace(ptRaw) != "" {
 			a.Attributes["plan_type"] = strings.TrimSpace(ptRaw)
+			if defaulted, _ := metadata["plan_type_defaulted"].(bool); defaulted {
+				a.Attributes["plan_type_defaulted"] = "true"
+			}
 		} else if idTokenRaw, ok := metadata["id_token"].(string); ok && strings.TrimSpace(idTokenRaw) != "" {
 			if claims, errParse := codex.ParseJWTToken(idTokenRaw); errParse == nil && claims != nil {
 				a.Attributes["plan_type"] = claims.GetPlanType()
+				a.Attributes["plan_type_defaulted"] = strconv.FormatBool(strings.TrimSpace(claims.CodexAuthInfo.ChatgptPlanType) == "")
 			} else {
 				a.Attributes["plan_type"] = codex.DefaultPlanType
+				a.Attributes["plan_type_defaulted"] = "true"
 			}
 		}
 	}

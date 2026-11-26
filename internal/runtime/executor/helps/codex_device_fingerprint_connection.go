@@ -2,6 +2,7 @@ package helps
 
 import (
 	"net/http"
+	"slices"
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
@@ -32,15 +33,20 @@ func (p CodexDevicePolicy) ApplyHeadersFromSource(target, source http.Header) {
 	if !p.Enabled || target == nil {
 		return
 	}
-	var values []string
-	found := false
-	for key, list := range source {
+	var keys []string
+	for key := range source {
 		if strings.EqualFold(key, "X-Codex-Turn-Metadata") {
-			found = true
-			values = append(values, list...)
+			keys = append(keys, key)
 		}
 	}
-	if found {
+	if len(keys) > 0 {
+		// Preserve each key's value order and make case-variant merging stable
+		// across retries that rebuild headers from the same caller snapshot.
+		slices.Sort(keys)
+		var values []string
+		for _, key := range keys {
+			values = append(values, source[key]...)
+		}
 		for key := range target {
 			if strings.EqualFold(key, "X-Codex-Turn-Metadata") {
 				delete(target, key)

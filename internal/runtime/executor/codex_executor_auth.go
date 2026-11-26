@@ -220,11 +220,26 @@ func (e *CodexExecutor) refreshLocked(ctx context.Context, auth *cliproxyauth.Au
 		if (strings.TrimSpace(diskOuterRef) != "" && strings.TrimSpace(diskOuterRef) != strings.TrimSpace(inOuterRef)) ||
 			(strings.TrimSpace(diskOuterAcc) != "" && strings.TrimSpace(diskOuterAcc) != strings.TrimSpace(inOuterAcc)) {
 			diskRotatedOuter = true
-			for _, key := range []string{"id_token", "access_token", "refresh_token", "account_id", "last_refresh", "email", "expired", "plan_type", "type"} {
+			for _, key := range []string{"id_token", "access_token", "refresh_token", "account_id", "last_refresh", "email", "expired", "plan_type", "plan_type_defaulted", "type"} {
 				if val, exists := diskMap[key]; exists {
 					auth.Metadata[key] = val
+				} else if key == "plan_type" || key == "plan_type_defaulted" {
+					delete(auth.Metadata, key)
 				}
 			}
+			// Plan provenance belongs to the adopted credential partition.
+			clonedAttributes := make(map[string]string, len(auth.Attributes)+2)
+			for k, v := range auth.Attributes {
+				clonedAttributes[k] = v
+			}
+			delete(clonedAttributes, "plan_type")
+			delete(clonedAttributes, "plan_type_defaulted")
+			if planType, okPlan := auth.Metadata["plan_type"].(string); okPlan && strings.TrimSpace(planType) != "" {
+				clonedAttributes["plan_type"] = strings.TrimSpace(planType)
+				defaulted, _ := auth.Metadata["plan_type_defaulted"].(bool)
+				clonedAttributes["plan_type_defaulted"] = strconv.FormatBool(defaulted)
+			}
+			auth.Attributes = clonedAttributes
 		}
 		diskSIWC, _ := diskMap["siwc"].(map[string]any)
 		inSIWC, _ := auth.Metadata["siwc"].(map[string]any)
@@ -415,25 +430,30 @@ func (e *CodexExecutor) refreshLocked(ctx context.Context, auth *cliproxyauth.Au
 				auth.Metadata["last_refresh"] = time.Now().Format(time.RFC3339)
 
 				planType := strings.TrimSpace(td.PlanType)
+				planTypeDefaulted := td.PlanTypeDefaulted || planType == ""
 				if planType == "" && td.IDToken != "" {
 					if claims, errParse := codexauth.ParseJWTToken(td.IDToken); errParse == nil && claims != nil {
 						planType = claims.GetPlanType()
+						planTypeDefaulted = strings.TrimSpace(claims.CodexAuthInfo.ChatgptPlanType) == ""
 					}
 				}
 				if planType == "" {
 					planType = codexauth.DefaultPlanType
 				}
 				auth.Metadata["plan_type"] = planType
+				auth.Metadata["plan_type_defaulted"] = planTypeDefaulted
 				clonedAttributes := make(map[string]string, len(auth.Attributes)+1)
 				for k, v := range auth.Attributes {
 					clonedAttributes[k] = v
 				}
 				clonedAttributes["plan_type"] = planType
+				clonedAttributes["plan_type_defaulted"] = strconv.FormatBool(planTypeDefaulted)
 				auth.Attributes = clonedAttributes
 				if storage, ok := auth.Storage.(*codexauth.CodexTokenStorage); ok && storage != nil {
 					clonedStorage := *storage
 					svc.UpdateTokenStorage(&clonedStorage, td)
 					clonedStorage.PlanType = planType
+					clonedStorage.PlanTypeDefaulted = planTypeDefaulted
 					auth.Storage = &clonedStorage
 				}
 			}

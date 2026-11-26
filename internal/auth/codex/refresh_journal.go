@@ -226,13 +226,14 @@ func decodeRefreshReceipt(value ojson.Result) (*CodexTokenData, error) {
 		return nil, fmt.Errorf("invalid refresh receipt")
 	}
 	return &CodexTokenData{
-		AccessToken:  value.Get("access_token").String(),
-		RefreshToken: value.Get("refresh_token").String(),
-		IDToken:      value.Get("id_token").String(),
-		AccountID:    value.Get("account_id").String(),
-		Email:        value.Get("email").String(),
-		Expire:       value.Get("expired").String(),
-		PlanType:     value.Get("plan_type").String(),
+		AccessToken:       value.Get("access_token").String(),
+		RefreshToken:      value.Get("refresh_token").String(),
+		IDToken:           value.Get("id_token").String(),
+		AccountID:         value.Get("account_id").String(),
+		Email:             value.Get("email").String(),
+		Expire:            value.Get("expired").String(),
+		PlanType:          value.Get("plan_type").String(),
+		PlanTypeDefaulted: value.Get("plan_type_defaulted").Bool(),
 	}, nil
 }
 

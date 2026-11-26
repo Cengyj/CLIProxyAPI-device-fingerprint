@@ -49,9 +49,14 @@ type CodexAutoExecutor struct {
 }
 
 func NewCodexAutoExecutor(cfg *config.Config) *CodexAutoExecutor {
+	httpExec := NewCodexExecutor(cfg)
+	wsExec := NewCodexWebsocketsExecutor(cfg)
+	// Transport selection must not discard recent same-account identity hints.
+	// The bounded resolver belongs to this auto executor, never global state.
+	wsExec.deviceResolver = httpExec.deviceResolver
 	return &CodexAutoExecutor{
-		httpExec: NewCodexExecutor(cfg),
-		wsExec:   NewCodexWebsocketsExecutor(cfg),
+		httpExec: httpExec,
+		wsExec:   wsExec,
 	}
 }
 

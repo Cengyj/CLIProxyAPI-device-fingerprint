@@ -27,6 +27,8 @@ type CodexTokenData struct {
 	Expire string `json:"expired"`
 	// PlanType is the subscription plan type (e.g. "free", "plus", "pro", "team")
 	PlanType string `json:"plan_type,omitempty"`
+	// PlanTypeDefaulted distinguishes an absent claim from an explicit free plan.
+	PlanTypeDefaulted bool `json:"plan_type_defaulted"`
 }
 
 // CodexSIWCTokenData holds the OAuth token information obtained from OpenAI's Sign in with ChatGPT (SIWC) flow.

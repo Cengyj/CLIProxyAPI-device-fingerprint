@@ -162,7 +162,7 @@ func (r *CodexDeviceResolver) accountIdentity(auth *cliproxyauth.Auth) codexDevi
 	if account == "" {
 		account = strings.TrimSpace(auth.Attributes["account_id"])
 	}
-	identity := codexDeviceAccount{account: account, user: codexDeviceAuthString(auth, "chatgpt_user_id"), plan: codexDeviceAuthString(auth, "plan_type")}
+	identity := codexDeviceAccount{account: account, user: codexDeviceAuthString(auth, "chatgpt_user_id"), plan: codexDevicePlanType(auth)}
 	if identity.plan == "" {
 		identity.plan = codexDeviceAuthString(auth, "chatgpt_plan_type")
 	}
@@ -212,6 +212,22 @@ func (i codexDeviceAccount) subject(authID string) [32]byte {
 		}
 	}
 	return sha256.Sum256([]byte(seed))
+}
+
+// codexDevicePlanType ignores only a documented default, preserving explicit free.
+func codexDevicePlanType(auth *cliproxyauth.Auth) string {
+	if plan := strings.TrimSpace(auth.Attributes["plan_type"]); plan != "" {
+		defaulted := strings.EqualFold(strings.TrimSpace(auth.Attributes["plan_type_defaulted"]), "true")
+		if !defaulted || !strings.EqualFold(plan, codexauth.DefaultPlanType) {
+			return plan
+		}
+	}
+	plan := codexDeviceMetadataString(auth, "plan_type")
+	defaulted, _ := auth.Metadata["plan_type_defaulted"].(bool)
+	if defaulted && strings.EqualFold(plan, codexauth.DefaultPlanType) {
+		return ""
+	}
+	return plan
 }
 
 func codexDeviceAuthString(auth *cliproxyauth.Auth, key string) string {
