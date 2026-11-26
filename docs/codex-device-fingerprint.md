@@ -125,6 +125,14 @@ producer must preserve the same provenance; that remote producer was not availab
 for validation in this checkout. Use an explicit installation override when its
 missing-plan recovery cannot be established.
 A token associated with a different account cannot supply its old member/plan.
+When refresh adopts newer credentials already rotated on disk, it replaces or
+clears the old account, member, plan and auxiliary token hints as one identity
+partition. A newly supplied disk member or token cannot be shadowed by the old
+in-memory member, including when both members use the same explicit installation ID.
+Absent versioned account/token fields are explicitly cleared through the existing
+refresh patch, keeping Manager version checks intact. A late refresh whose outer
+credential partition has been superseded cannot replace the current identity
+hints, even when its independent SIWC partition can still be applied.
 The current `Metadata.id_token` takes precedence over an auxiliary
 `Attributes.id_token`, matching OAuth refresh persistence; mode and explicit
 installation overrides retain their separate Attributes-first priority.
@@ -283,11 +291,12 @@ controls. Helper files live in `helps/`, not alongside executor implementations.
 | `.gitignore` | Allow this maintenance document to be versioned under the existing ignored `docs/` directory. |
 | `config.example.yaml` / `oauth.providers.codex` | Describe defaults and opt-in behavior without changing real configuration. |
 | `internal/config/config_types.go` / `CodexConfig` | Add mode string and optional inject boolean. Keep automatic OAuth mapping; do not move them under shared upstream settings. |
-| `internal/config/config_yaml.go` / `renderConfigSave`, `isKnownDefaultValue` | Preserve newly added explicit inject false and its provider mapping; remove the saved field when the optional value returns to nil. |
+| `internal/config/config_yaml.go` / `renderConfigSave`, `isKnownDefaultValue` | Preserve newly added explicit inject false and its provider mapping; remove the saved field when the optional value returns to nil. Clearing mode must also remove the old saved mode instead of retaining device through the comment-preserving merge. |
 | `internal/watcher/synthesizer/file.go` / `synthesizeFileAuths` | Label parser-defaulted free in synthesized attributes while preserving existing plan defaults and explicit values. |
 | `internal/auth/codex/openai.go`, `token.go` / token data, storage and outer credential allowlist; `openai_auth.go` / exchange, refresh, storage creation/update; `refresh_journal.go` / `decodeRefreshReceipt` | Carry source provenance with refreshed credentials, including false to clear prior true; never substitute a token-derived default for an explicit plan. |
+| `internal/auth/codex/refresh_patch.go` / `CanApplyOuterTo`; `sdk/cliproxy/auth/metadata_merge.go` / `mergeAuthContent` | Check the outer credential version separately from SIWC before accepting refreshed identity hints. Keep Metadata and auxiliary Attributes with the accepted outer credentials; preserve valid independent SIWC refreshes. |
 | `sdk/auth/codex_device.go` / `buildAuthRecord` | Copy plan provenance to initial login storage, Metadata and Attributes; raw explicit token plans clear defaulted provenance. |
-| `internal/runtime/executor/codex_executor_auth.go` / `refreshLocked` | Preserve plan provenance through refresh/save; adopting rotated disk credentials clears stale plan/source fields and synchronizes attributes. |
+| `internal/runtime/executor/codex_executor_auth.go` / `refreshLocked` | Preserve plan provenance through refresh/save; adopting rotated disk credentials replaces/clears old account/member/token/plan metadata and auxiliary attributes together, without changing administrator device overrides. |
 | `internal/watcher/diff/config_diff.go` / `BuildConfigChangeDetails` | Expose hot reload changes using bounded/sanitized mode descriptions and optional boolean values, with no device/account data. |
 | `internal/runtime/executor/codex_executor.go` / `CodexExecutor`, `NewCodexExecutor` | Own bounded resolver state for the executor lifetime, never a global current ID. |
 | `internal/runtime/executor/codex_executor_request.go` / `cacheHelper`, `cacheHelperDoc` | Resolve selected auth/route once, validate ambiguity, mutate the same Doc before `FinalizePayloadDoc`; carry snapshot on the resulting request context through compression fallback. |
@@ -343,6 +352,11 @@ Independent implementation files:
 - `sdk/cliproxy/codex_device_fingerprint_test.go`: real file save/migration, watcher
   reload/dispatch, Service executor replacement and Manager HTTP/WS captures.
   It synchronizes on the production reload/queue path, not fsnotify debounce timing.
+- The `codex_device_fingerprint_round3_*_test.go` executor files and
+  `codex_device_fingerprint_round3_test.go` config/Service files cover escaped
+  singleton keys, final non-string/duplicate device identities, newly observed
+  business-frame identity, rotated disk members, Manager partition/version merging,
+  stale storage save/reload and clearing/removing overrides.
 
 Inspected but intentionally unchanged: `config_v8.go`, `oauth_scope.go`,
 `oauth_scope_executor.go` (API-key views share a resolver pointer instead of copying
@@ -406,7 +420,8 @@ go test -mod=readonly ./internal/config ./internal/watcher/diff ./internal/runti
 go test -mod=readonly -race ./internal/runtime/executor/helps ./internal/runtime/executor -run 'CodexDeviceFingerprint' -count=1
 go test -mod=readonly ./internal/auth/codex ./internal/watcher/synthesizer ./sdk/auth ./sdk/cliproxy ./sdk/cliproxy/auth -count=1
 go test -mod=readonly -race ./internal/auth/codex ./internal/watcher/synthesizer ./sdk/auth ./sdk/cliproxy -run CodexDeviceFingerprint -count=1
-go vet ./internal/config ./internal/watcher/diff ./internal/runtime/executor/helps ./internal/runtime/executor ./internal/auth/codex ./internal/watcher/synthesizer ./sdk/auth ./sdk/cliproxy
+go test -mod=readonly -race ./internal/auth/codex ./sdk/cliproxy/auth -run 'Test(MergeRefreshedAuth|MergeRefreshedAndExistingAuthMetadataPreservesSIWC|CredentialRefreshPatchChecksPartitionsIndependently|Issue6819_)' -count=1
+go vet ./internal/config ./internal/watcher/diff ./internal/runtime/executor/helps ./internal/runtime/executor ./internal/auth/codex ./internal/watcher/synthesizer ./sdk/auth ./sdk/cliproxy ./sdk/cliproxy/auth
 go test -mod=readonly ./...
 go build -o test-output ./cmd/server && rm test-output
 git diff --check
@@ -651,3 +666,77 @@ tested without expanding these routes. Passing repository regressions does not
 mean every excluded protocol was exercised against a real upstream. The feature
 remains off by default; no deployment, real credential/configuration modification,
 dependency change or remote write was performed.
+
+
+## Additional review rounds (2026-11-26)
+
+Apply after the preceding six implementation/maintenance commits:
+
+7. `30e777e0320efff0f752f45a8a09e71ffa9a2cf4` — configuration rollback,
+   adopted credential identity, partition-aware Manager merging and 12 retained
+   regressions. Production changes are limited to four existing files.
+8. Resolve this accompanying documentation commit with
+   `git log -1 --format=%H -- docs/codex-device-fingerprint.md`.
+
+The reviews reproduced and corrected three behavior gaps:
+
+- Clearing a previously enabled mode was omitted from generated YAML, leaving
+  the old `device` value in the comment-preserving save. Empty mode now removes
+  the old entry, verified through save, watcher, Service, Manager and captured
+  HTTP/WS requests across legacy, migration and v8 layouts.
+- Adopting credentials rotated on disk could retain an old member or auxiliary
+  identity hint. Adoption now replaces the identity partition. The intermediate
+  repair also exposed a Manager version-check failure when account/token fields
+  were deleted before merging; explicit empty values now travel through the
+  existing credential patch. Captured bearer, account header and installation
+  values agree before and after file persistence and synthesis. Stale token
+  storage cannot restore the prior credential, and concurrent administrator
+  settings remain intact.
+- A late dual-partition refresh could retain valid SIWC changes while merging
+  an obsolete outer member into newer outer credentials. A read-only outer
+  version check now preserves current identity Metadata and Attributes when that
+  partition is superseded. Real Manager and HTTP tests confirm both the current
+  outer subject and independently refreshed SIWC bearer.
+
+Additional HTTP/WS captures cover escaped singleton keys, escaped interrupt
+metadata, administrator-provided non-string/duplicate final identity values,
+required-socket replay rejection and identity first introduced in a business
+frame. These cases required no further WS production changes. Normal compatible
+connections remain reusable; final administrator values are never rewritten.
+
+Final acceptance for code commit `30e777e0320efff0f752f45a8a09e71ffa9a2cf4`:
+
+| Check | Result |
+|---|---|
+| Feature selection across eight packages | PASS; 91 top-level tests, 12 added in this review |
+| Five named payload/session barriers | PASS |
+| Nine complete affected/dependent packages, `-count=1` | PASS |
+| Extended feature race and existing credential/Manager merge race selections | PASS; selectors matched tests |
+| `go vet` across all nine relevant packages | PASS |
+| `go test -mod=readonly ./...` | PASS on final source |
+| Server build and removal of `test-output` | PASS |
+| `gofmt -w .`, `git diff --check` | PASS; the same two unrelated formatting-only changes were restored |
+| Dependencies, real credentials/configuration, deployment, remote writes | Unchanged / none |
+
+An earlier full run failed the new Manager regression before its repair and
+`TestServiceHeartbeatFailoverDoesNotDrainBlockingScope`. The latter reproduced
+3 times in 30 runs on the exact official baseline, whose 2,670 tracked file
+hashes were independently reverified. Its 100ms heartbeat detection plus up to
+approximately 1s randomized retry can exceed the test's approximately 1.05s
+wait. No Home source or assertion was changed; the later passing run does not
+mean that pre-existing timing issue was fixed. No final feature failure or
+environment blocker remains in this validation.
+
+Evidence is retained locally under `/tmp/codex-device-round3/`: the final
+`accepted-feature.log`, `accepted-inventory.log`, `accepted-race.log`,
+`accepted-manager-race.log`, `accepted-barriers.log`, `accepted-packages.log`,
+`accepted-vet.log` and `accepted-full.log`; reproduction/classification details
+are in `identity-cross-fix-status.txt`, `cross-concurrency-status.txt` and
+`heartbeat-baseline-status.txt`. Temporary evidence files are not build inputs.
+
+The feature remains disabled by default. Local request verification is complete;
+running-program/configuration enablement remains unverified. No production
+upstream was contacted. Missing or historically ambiguous account/plan metadata,
+remote Home producers, actual external billing and full device emulation retain
+the limits documented above. Upgrade review must now also preserve outer/SIWC
+partition version checks at the Manager identity merge boundary.
