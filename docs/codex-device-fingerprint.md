@@ -114,6 +114,9 @@ Selection order:
 The parser is used only for existing credential metadata, not a new authentication
 protocol. Missing plan claims are not treated as the parser's default `free`.
 A token associated with a different account cannot supply its old member/plan.
+The current `Metadata.id_token` takes precedence over an auxiliary
+`Attributes.id_token`, matching OAuth refresh persistence; mode and explicit
+installation overrides retain their separate Attributes-first priority.
 Team-like identities without a user ID fall back to `auth.ID` with a bounded
 warning, rather than merging members by workspace ID. Explicit IDs avoid this
 fallback.
@@ -139,6 +142,8 @@ Each executor retains at most 512 recent identity hints in a mutex-protected LRU
 there are no token caches, background workers, database changes or per-request
 credential writes. Hints fill temporarily missing fields only for a compatible
 account, and cannot mix a new account with the previous account's user/plan.
+If partial metadata contradicts a cached member while its account is absent, the
+old hint is evicted immediately; a later empty refresh cannot resurrect it.
 Executor replacement during configuration reload also discards these hints.
 Warnings are bounded by reason per executor and contain no account, user, email,
 JWT, token or full device value.
@@ -167,8 +172,16 @@ when no conflicting explicit rules apply. The module never rewrites final payloa
 to repair such a conflict.
 
 Each physical WS connection holds its policy and a minimal identity made from
-final device values and mode/SIWC scope. It ignores turn/session/thread/cache fields.
+final device values, mode/SIWC scope, and a private digest of the selected credential
+subject. The subject guard prevents an authenticated socket from being reused for
+a different account or Team member even when an administrator assigns the same
+public UUID or filters all device fields. It does not change public UUID derivation
+or make shared administrator UUIDs automatically isolated. If metadata cannot
+reveal a subject change, the guard cannot infer one from unchanged auth/device IDs. It ignores turn/session/thread/cache fields.
 Missing device fields impose no new identity and do not generate random reconnects.
+A newly requested device handshake header requires a new handshake: an ordinary
+complete request reconnects; a continuation or active duplex requests replay.
+Candidate headers are never remembered as sent when the socket was merely reused.
 Effective explicit overrides participate in compatibility; derived IDs alone are
 not used as the reuse key. Ordinary complete requests reconnect at an existing safe
 boundary when incompatible. Required-socket, previous-response and instruction-chain
@@ -176,7 +189,9 @@ continuations fail through the existing replay/session recovery mechanism instea
 of moving an incremental request to another connection.
 
 An active duplex freezes device mode, installation policy, injection and SIWC
-semantics. Subsequent create/append pass through the normal final business barrier;
+semantics from the actual physical socket, including when the initial complete
+request reused that socket through an administrator override. A later policy
+masked by final rules cannot silently become the connection policy. Subsequent create/append pass through the normal final business barrier;
 steer rewrites only existing device fields before its business rules. Its `type`
 discriminator remains necessary transport framing. Interrupt uses the target
 connection's locked snapshot and existing pointer/state rechecks, preserves its
@@ -184,6 +199,8 @@ control fields, and does not acquire ordinary payload rules. Device values first
 presented by an interrupt are bound under the connection lock before sending,
 so later business frames cannot silently adopt a different identity. Ambiguous configured
 control identities are rejected rather than sent on an incompatible connection.
+A failed interrupt write retires the enabled socket and clears device state,
+because a partial frame may already have exposed its identity.
 Connection detach, invalidate, close and competing dial paths clear device state
 alongside connection state. Existing lock order, lifecycle End/close-once behavior
 and liveness deadlines are preserved; no post-connect timeout was added.
@@ -254,24 +271,33 @@ controls. Helper files live in `helps/`, not alongside executor implementations.
 | Same request file / `applyCodexHeadersWithSIWC` | Both normal and SIWC early-return branches run built-ins before `ApplyCustomHeadersFromAttrs`; model overrides remain later. No independent identity resolution in header helpers. |
 | `internal/runtime/executor/codex_websockets_execute.go` / `Execute` | Snapshot and modify before finalizer, derive compatibility from final body/handshake, gate required/connection-bound reuse and retry with the same snapshot. |
 | `internal/runtime/executor/codex_websockets_stream.go` / `ExecuteStream`, `codexWebsocketPrepared`, `prepareCodexWebsocketStream`, `prepareCodexWebsocketStreamWithDevice` | Prepared state carries policy/effective identity; normal attempts resolve anew, duplex supplies frozen policy; final rules execute once before serialization/framing. |
-| `internal/runtime/executor/codex_websockets_request.go` / `prepareSessionInstructions`, `applyCodexWebsocketHeaders` | Exclude incompatible connection proof, check final identity before sending, and process both handshake branches before administrator header overrides. |
-| `internal/runtime/executor/codex_websockets_session.go` / `codexWebsocketSession`, device binding/reuse helpers, `ensureUpstreamConnWithSIWC`, detach/invalidate/close | Physical identity is protected by `connMu`. Install/clear it with the connection; no lock held across dial or auth-manager work, and no stale state after losing a dial race. Shared transport users keep existing behavior. |
-| `internal/runtime/executor/codex_websockets_duplex.go` / `streamCodexDuplex` | Freeze device policy for create/append; steer changes existing fields before final business rules; validate effective compatibility without modifying final values. |
-| `internal/runtime/executor/codex_websockets_executor.go` / `InterruptExecutionSession` | Read target policy inside existing connection-pointer/state checks; only existing fields, no ordinary business payload rules; reject incompatible control identity. |
+| `internal/runtime/executor/codex_websockets_request.go` / `prepareSessionInstructions`, `applyCodexWebsocketHeaders` | Exclude incompatible connection proof using one locked target/device snapshot, without a second off-mode transport check; check final identity before sending, and process both handshake branches before administrator header overrides. |
+| `internal/runtime/executor/codex_websockets_session.go` / `codexWebsocketSession`, device binding/reuse helpers, `ensureUpstreamConnWithSIWC`, detach/invalidate/close | Physical identity is protected by `connMu`. Install/clear it with the connection; no lock held across dial or auth-manager work, and no stale state after losing a dial race. Require a new handshake for newly requested device headers; omitted candidate headers remain unconstrained. Shared transport users keep existing behavior. |
+| `internal/runtime/executor/codex_websockets_duplex.go` / `streamCodexDuplex` | Freeze the actual physical socket policy for create/append, including a reused initial connection; reject candidate handshake changes. Steer changes existing fields before final business rules, and only its body contributes new observed identity; validate compatibility without modifying final values. |
+| `internal/runtime/executor/codex_websockets_executor.go` / `InterruptExecutionSession` | Read target policy inside existing connection-pointer/state checks; only existing fields, no ordinary business payload rules; reject incompatible control identity. Invalidate an enabled socket after a failed control write to clear uncertain bindings. |
 
 Independent implementation files:
 
 - `internal/runtime/executor/helps/codex_device_fingerprint.go`: resolver, immutable
-  policy, bounded state, UUID/claims selection, local Doc/header handling, final
-  effective identity compatibility.
+  policy, bounded state, UUID/claims selection, private credential subject binding,
+  local Doc/header handling, final effective identity compatibility.
 - `internal/runtime/executor/helps/codex_device_fingerprint_connection.go`: complete
-  source header forwarding and identity checks against a frozen duplex policy.
+  source header forwarding, handshake compatibility and identity checks against a
+  frozen duplex policy.
 - `internal/runtime/executor/helps/codex_device_fingerprint_test.go`: identity,
   golden vectors, shapes/duplicates/precision, scope, state bounds and concurrency.
 - `internal/runtime/executor/codex_device_fingerprint_test.go`: HTTP wire captures,
   final rules, compression fallback, auth reselection, scope and header precedence.
 - `internal/runtime/executor/codex_device_fingerprint_ws_test.go`: real handshakes,
   frames, reuse/reconnect/continuations, duplex and interrupt lifecycle.
+- `internal/runtime/executor/helps/codex_device_fingerprint_review_test.go`: strict
+  review regressions for credential subject, canonical refreshed token, handshake
+  compatibility, stale hint invalidation, escaped duplicate keys and pending Doc
+  mutations.
+- `internal/runtime/executor/codex_device_fingerprint_review_http_test.go`: excluded
+  direct-image route with an inherited Responses attempt context.
+- `internal/runtime/executor/codex_device_fingerprint_review_ws_test.go`: subject
+  changes, physical policy handoff, handshake changes and failed interrupt cleanup.
 - `internal/runtime/executor/codex_device_fingerprint_persist_test.go`: synthetic
   refresh/save preservation and administrator edits.
 - `internal/config/codex_device_fingerprint_test.go` and
@@ -302,7 +328,7 @@ git remote -v
 git fetch upstream --tags
 git show --no-patch --format=fuller <chosen-official-tag-or-commit>
 git switch -c <new-upgrade-candidate> <chosen-official-tag-or-commit>
-git cherry-pick <feature-code-commit> <maintenance-document-commit>
+git cherry-pick <feature-code-commit> <maintenance-document-commit> <review-fix-commit> <review-document-commit>
 ```
 
 Resolve conflicts semantically and inspect every integration point. Never use
@@ -359,8 +385,7 @@ ordinary full WS requests switch at a safe reconnect boundary. Finish/restart
 active duplex streams or restart the service if every socket must switch now.
 
 For code rollback on a local candidate, preserve the current branch and create a
-new branch at the recorded official baseline, or revert the feature code commit
-and then the documentation commit on an established branch. Verify build/tests
+new branch at the recorded official baseline, or revert the documented patch commits in reverse order on an established branch. Verify build/tests
 and review any now-unrecognized configuration fields before adoption. Do not reset
 unrelated local work. Code rollback restores upstream CPA's own cloaking and
 session logic, not a promise of raw client-byte forwarding.
@@ -376,10 +401,10 @@ Patch commit list:
 
 1. `2d5e1b9c19a4e56f484681d16021fc387c856ace` — feature code, configuration,
    HTTP/WS integration and tests (buildable independently).
-2. `docs(codex): document device fingerprint operation and upstream patch maintenance`
-   — this document and its `.gitignore` exception. Resolve its exact SHA with
-   `git log -1 --format=%H -- docs/codex-device-fingerprint.md`; the delivery reply
-   also records it. This avoids embedding a commit's own hash into its content.
+2. `ddd7715baac03dd0bc257cdcf5c34c2880996d03` — initial operation and maintenance
+   document and its `.gitignore` exception.
+3. The subsequent strict-review fix and documentation commits are listed in the
+   follow-up record below.
 
 New test count: 40 top-level `TestCodexDeviceFingerprint*` tests with table-driven
 subtests. Required feature tests, the five named payload/session regressions,
@@ -445,3 +470,103 @@ Detailed local run logs are available for this implementation session at
 `/tmp/codex-device-baseline-aistudio-repro.log`, and
 `/tmp/codex-device-second-baseline-status.txt`. These temporary logs are supporting
 local evidence, not required build inputs or durable release artifacts.
+
+
+## Strict review follow-up (2026-11-26)
+
+Three review rounds combined adversarial helper probes, captured HTTP/WS requests,
+and a final cross-path/lifecycle review. Demonstrated issues were fixed locally:
+
+1. An unchanged administrator/SIWC UUID could conceal an account or Team member
+   change on an authenticated socket. A private subject digest now participates in
+   ordinary connection and frozen duplex checks, independently of the public UUID.
+2. An old `Attributes.id_token` could displace refreshed `Metadata.id_token` and
+   lose the current Team member claims. The canonical metadata token now wins.
+3. Conflicting partial member metadata left an old LRU hint available for a later
+   empty refresh. Both map and list entries are now removed on that contradiction.
+4. A complete request could reuse a socket through final administrator overrides
+   and then start duplex with a newly resolved policy. Handoff now freezes the
+   socket's actual policy; subsequent incompatible input requires replay.
+5. A newly configured device handshake header could be recorded without ever
+   being sent. Reuse now compares requested headers with the actual handshake;
+   full requests reconnect, while continuation/duplex rejects before sending.
+   Steer only contributes body identity because it performs no handshake.
+6. An interrupt write failure could leave the connection and its newly bound
+   identity retained. The enabled socket now retires through existing lifecycle
+   invalidation, without changing lock order or adding timeouts.
+7. The new device binding guard also ran while both policies were disabled. If
+   the socket disconnected before binding, this converted an existing transport
+   recovery into a replay-required error. Disabled binding now delegates to the
+   original transport-loss path. The existing refused-create/idle-loss integration
+   test passed 300 repetitions on the exact official baseline, failed 101 of 300
+   on the pre-fix candidate, and passed 300 after the fix.
+
+The ordinary coherent identity comparison also skips map allocation and parsing
+of canonical value lists; conflict checks retain their conservative behavior.
+No throughput or latency benchmark claim is made. Public UUID golden vectors,
+explicit override precedence, default-off semantics and final payload barriers
+are unchanged. No dependency, actual configuration, auth file or remote was changed.
+
+The retained strict-review regressions extend the original 40 top-level tests;
+the final count is recorded in the acceptance table below. A temporary comparison probe ran against the exact official baseline
+and the candidate: final HTTP Execute, ExecuteStream and compact body bytes and
+header maps were identical with the feature disabled. All 2,670 baseline tracked
+file contents were reverified against Git blob hashes before accepting that result.
+The probe was removed from both trees after comparison. The retained HTTP review
+test also captures the direct-image route with an inherited enabled Responses
+context and verifies the route replaces it with a disabled snapshot.
+
+Follow-up commits and final acceptance results are recorded below. Earlier
+intermittent failures remain in the initial delivery record; they are not silently
+reclassified or erased by this review.
+
+
+The first follow-up full-suite run exposed an Antigravity credit-hint recovery
+failure and the disabled WS loss regression described above. The Antigravity test
+`TestAntigravityManagerExecuteAndStream_ToppedUpCreditsRecoverDuringQuotaCooldown`
+reproduced twice in 30 repetitions on the exact official baseline, with the same
+line-985 unknown-hint assertion (the initial candidate full run failed the stream
+variant). It is a baseline intermittent failure; no Antigravity code or test was
+changed. The WS loss failure did not reproduce on that baseline and was therefore
+investigated and fixed as a patch regression, not dismissed as an upstream flake.
+
+Follow-up patch commits (apply after the two initial commits):
+
+3. `c7b601ac8e7990bcb8a2e6967b8a8ee0ad8f5e2f` — strict-review fixes and 14 new
+   regression tests; independently buildable.
+4. `docs(codex): record strict review fixes and final validation` — this follow-up
+   maintenance record. Resolve its SHA with
+   `git log -1 --format=%H -- docs/codex-device-fingerprint.md` or the delivery reply.
+
+Final acceptance for review-fix commit `c7b601ac8e7990bcb8a2e6967b8a8ee0ad8f5e2f`:
+
+| Check | Result |
+|---|---|
+| Feature selection in config/diff/helpers/executor | PASS; 54 top-level tests with subtests (14 added in this review) |
+| Five named payload/session final-barrier tests | PASS |
+| Complete config/diff/helpers/executor tests, `-count=1` | PASS on final confirmation; executor 45.829s |
+| Feature tests with `-race` | PASS in both helpers and executor |
+| Existing WS loss regression, 300 repetitions | PASS after fix |
+| Existing session-instructions/duplex/interrupt/lifecycle selection | PASS |
+| `go vet` for the four relevant packages | PASS |
+| `go test -mod=readonly ./...` | PASS on final run; executor 43.221s, OpenAI handlers 10.484s |
+| Server build and removal of `test-output` | PASS |
+| `gofmt -w .`, `git diff --check` | PASS; only the same two unrelated formatter changes were restored |
+| Official baseline off-mode HTTP wire comparison | PASS for Execute, ExecuteStream and compact |
+| Dependency changes / production calls / remote writes | None |
+
+An intermediate related-package run also encountered the previously baseline-proven
+AIStudio conductor timeout and the newly baseline-proven Antigravity hint failure.
+The final confirmation and full-suite runs passed. Neither unrelated test was
+weakened. No validation was blocked by the environment. Real-account operation,
+production rollout, future official versions and complete physical-device
+emulation remain outside this local validation.
+
+Review logs are in `/tmp/codex-device-strict-review/`: `feature-confirmation.log`,
+`test-inventory.log`, `barriers-delivery.log`, `packages-confirmation.log`,
+`race-delivery.log`, `vet-delivery.log`, `full-delivery.log`,
+`baseline-new-failures.log`, `baseline-ws-loss-300.log`,
+`candidate-ws-loss-300.log`, `candidate-ws-loss-bind-noop.log`,
+`ws-off-followup-loss300.log`, and `off-parity-result.txt`. Earlier failed runs
+(`full-final.log`, `packages-delivery.log`) remain available for comparison.
+These temporary files are review evidence, not dependencies of the patch.
