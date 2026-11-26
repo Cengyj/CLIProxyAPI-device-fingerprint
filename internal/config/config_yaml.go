@@ -102,6 +102,10 @@ func renderConfigSave(data []byte, persistCfg *Config, migrating bool) ([]byte, 
 	if persistCfg != nil && persistCfg.Codex.DeviceFingerprintInjectMissing == nil {
 		deleteYAMLPath(original.Content[0], "codex.device-fingerprint-inject-missing")
 	}
+	if persistCfg != nil && persistCfg.Codex.DeviceFingerprintMode == "" {
+		// The omitted string must not leave a previously enabled mode on disk.
+		deleteYAMLPath(original.Content[0], "codex.device-fingerprint-mode")
+	}
 
 	// Merge generated into original in-place, preserving comments/order of existing nodes.
 	mergeMappingPreserve(original.Content[0], generated.Content[0])

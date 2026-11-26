@@ -220,20 +220,29 @@ func (e *CodexExecutor) refreshLocked(ctx context.Context, auth *cliproxyauth.Au
 		if (strings.TrimSpace(diskOuterRef) != "" && strings.TrimSpace(diskOuterRef) != strings.TrimSpace(inOuterRef)) ||
 			(strings.TrimSpace(diskOuterAcc) != "" && strings.TrimSpace(diskOuterAcc) != strings.TrimSpace(inOuterAcc)) {
 			diskRotatedOuter = true
-			for _, key := range []string{"id_token", "access_token", "refresh_token", "account_id", "last_refresh", "email", "expired", "plan_type", "plan_type_defaulted", "type"} {
+			for _, key := range []string{"id_token", "access_token", "refresh_token", "account_id", "last_refresh", "email", "expired", "plan_type", "plan_type_defaulted", "chatgpt_user_id", "chatgpt_plan_type", "type"} {
 				if val, exists := diskMap[key]; exists {
 					auth.Metadata[key] = val
-				} else if key == "plan_type" || key == "plan_type_defaulted" {
-					delete(auth.Metadata, key)
+				} else {
+					switch key {
+					case "account_id", "id_token":
+						// Keep versioned fields in the refresh patch so Manager's
+						// generic deletion pass cannot invalidate its baseline.
+						auth.Metadata[key] = ""
+					case "plan_type", "plan_type_defaulted", "chatgpt_user_id", "chatgpt_plan_type":
+						delete(auth.Metadata, key)
+					}
 				}
 			}
-			// Plan provenance belongs to the adopted credential partition.
+			// Identity hints belong to the adopted credential partition. Retaining
+			// an old member or auxiliary token can conceal a replacement subject.
 			clonedAttributes := make(map[string]string, len(auth.Attributes)+2)
 			for k, v := range auth.Attributes {
 				clonedAttributes[k] = v
 			}
-			delete(clonedAttributes, "plan_type")
-			delete(clonedAttributes, "plan_type_defaulted")
+			for _, key := range []string{"account_id", "id_token", "chatgpt_user_id", "chatgpt_plan_type", "plan_type", "plan_type_defaulted"} {
+				delete(clonedAttributes, key)
+			}
 			if planType, okPlan := auth.Metadata["plan_type"].(string); okPlan && strings.TrimSpace(planType) != "" {
 				clonedAttributes["plan_type"] = strings.TrimSpace(planType)
 				defaulted, _ := auth.Metadata["plan_type_defaulted"].(bool)

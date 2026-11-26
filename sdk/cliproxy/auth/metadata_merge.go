@@ -428,6 +428,25 @@ func mergeAuthContent(base, current, updated *Auth) *Auth {
 			}
 		}
 	}
+	if patch := updated.CodexRefreshPatch; patch != nil && patch.RefreshedOuter() && !patch.CanApplyOuterTo(current.Metadata) {
+		// A valid SIWC partition may allow this merge while the outer partition
+		// was superseded. Its identity hints must remain with its own tokens.
+		for _, key := range []string{"account_id", "id_token", "chatgpt_user_id", "chatgpt_plan_type", "plan_type", "plan_type_defaulted"} {
+			if value, exists := current.Metadata[key]; exists {
+				merged.Metadata[key] = value
+			} else {
+				delete(merged.Metadata, key)
+			}
+			if value, exists := current.Attributes[key]; exists {
+				if merged.Attributes == nil {
+					merged.Attributes = make(map[string]string)
+				}
+				merged.Attributes[key] = value
+			} else {
+				delete(merged.Attributes, key)
+			}
+		}
+	}
 
 	return merged
 }

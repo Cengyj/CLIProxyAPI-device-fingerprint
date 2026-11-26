@@ -274,6 +274,15 @@ func (e *PartitionRefreshError) SIWCRefreshError() error {
 	return e.siwcErr
 }
 
+// CanApplyOuterTo reports whether the refreshed outer partition matches the target version.
+func (p *CredentialRefreshPatch) CanApplyOuterTo(target map[string]any) bool {
+	if p == nil || p.outerAfter == nil {
+		return false
+	}
+	matched, _ := matchesBaselineOrAfter(target, p.outerBefore, p.outerDiskBefore, p.outerAfter)
+	return matched
+}
+
 // CanApplyTo reports whether at least one refreshed partition in p still matches disk's version.
 func (p *CredentialRefreshPatch) CanApplyTo(disk map[string]any) bool {
 	if p == nil {
