@@ -8,6 +8,22 @@ import (
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 )
 
+// CompatibleHandshake checks a candidate handshake against the headers actually
+// sent on a retained socket. A newly requested device header needs a new socket;
+// it cannot be learned from a business frame that never transmits those headers.
+// Missing candidate fields impose no new identity requirement.
+func (i CodexDeviceIdentity) CompatibleHandshake(other CodexDeviceIdentity) bool {
+	if !i.Compatible(other) {
+		return false
+	}
+	for field := 2; field < len(i.values); field++ {
+		if other.values[field] != "" && i.values[field] != other.values[field] {
+			return false
+		}
+	}
+	return true
+}
+
 // ApplyHeadersFromSource preserves every caller turn-metadata value before the
 // built-in rewrite. Other headers keep the executor's existing forwarding rules.
 // Neither the caller map nor its slices are mutated. Administrator overrides
@@ -55,5 +71,5 @@ func (r *CodexDeviceResolver) CompatibleFrozenAuth(policy CodexDevicePolicy, aut
 	copyAuth.Attributes["codex_device_fingerprint"] = "device"
 	cfg := &config.Config{Codex: config.CodexConfig{DeviceFingerprintMode: "device", DeviceFingerprintInjectMissing: &policy.InjectMissing}}
 	current := r.Resolve(cfg, &copyAuth, useSIWC, targetURL)
-	return current.Enabled && current.ID == policy.ID && current.SIWC == policy.SIWC
+	return current.Enabled && current.ID == policy.ID && current.SIWC == policy.SIWC && current.credentialSubject == policy.credentialSubject
 }

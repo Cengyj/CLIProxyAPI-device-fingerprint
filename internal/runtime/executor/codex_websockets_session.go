@@ -154,6 +154,11 @@ func (s *codexWebsocketSession) bindDevice(conn *websocket.Conn, device codexWeb
 	}
 	s.connMu.Lock()
 	defer s.connMu.Unlock()
+	// With convergence disabled on both sides, leave transport-loss handling
+	// to the existing write/read path rather than introducing a replay error.
+	if !s.device.policy.Enabled && !device.policy.Enabled {
+		return true
+	}
 	if s.conn != conn || !s.device.identity.Compatible(device.identity) {
 		return false
 	}
@@ -531,14 +536,17 @@ func existingWebsocketSessionConn(sess *codexWebsocketSession, authID string, ws
 // This variant is used only by Codex; other providers sharing the session
 // transport keep the original target-only contract.
 func existingCodexWebsocketSessionConn(sess *codexWebsocketSession, authID, wsURL, proxyURL string, useSIWC bool, device codexWebsocketDeviceSnapshot) (*websocket.Conn, *websocketConnectionCloser) {
-	conn, closer := existingWebsocketSessionConn(sess, authID, wsURL, proxyURL, useSIWC)
-	if conn == nil {
+	if sess == nil {
 		return nil, nil
 	}
+	// Keep the baseline single transport snapshot. A second pointer check could
+	// turn an off-mode transport loss into a newly introduced replay rejection.
 	sess.connMu.Lock()
-	matches := sess.conn == conn && sess.device.identity.Compatible(device.identity)
+	conn := sess.conn
+	closer := sess.connCloser
+	matches := conn != nil && closer != nil && websocketSessionTargetMatches(sess, authID, wsURL, proxyURL, useSIWC) && sess.device.identity.CompatibleHandshake(device.identity)
 	sess.connMu.Unlock()
-	if !matches {
+	if !matches || sess.upstreamDisconnectError(conn) != nil {
 		return nil, nil
 	}
 	return conn, closer
@@ -597,7 +605,7 @@ func detachMismatchedCodexWebsocketSessionConn(sess *codexWebsocketSession, auth
 	sess.connMu.Lock()
 	defer sess.connMu.Unlock()
 	conn := sess.conn
-	if conn == nil || (websocketSessionTargetMatches(sess, authID, wsURL, proxyURL, useSIWC...) && (device == nil || sess.device.identity.Compatible(device.identity))) {
+	if conn == nil || (websocketSessionTargetMatches(sess, authID, wsURL, proxyURL, useSIWC...) && (device == nil || sess.device.identity.CompatibleHandshake(device.identity))) {
 		return nil, nil, "", "", nil
 	}
 
@@ -814,7 +822,7 @@ func (e *CodexWebsocketsExecutor) ensureUpstreamConnWithSIWC(ctx context.Context
 	conn := sess.conn
 	closer := sess.connCloser
 	readerConn := sess.readerConn
-	matches := conn == nil || (websocketSessionTargetMatches(sess, authID, wsURL, proxyURL, useSIWC) && sess.device.identity.Compatible(device.identity))
+	matches := conn == nil || (websocketSessionTargetMatches(sess, authID, wsURL, proxyURL, useSIWC) && sess.device.identity.CompatibleHandshake(device.identity))
 	sess.connMu.Unlock()
 	if !matches {
 		return nil, nil, nil, cliproxyexecutor.NewUpstreamWebsocketReplayRequiredError()
@@ -842,7 +850,7 @@ func (e *CodexWebsocketsExecutor) ensureUpstreamConnWithSIWC(ctx context.Context
 
 	sess.connMu.Lock()
 	if sess.conn != nil {
-		if !websocketSessionTargetMatches(sess, authID, wsURL, dialProxyURL, useSIWC) || !sess.device.identity.Compatible(device.identity) {
+		if !websocketSessionTargetMatches(sess, authID, wsURL, dialProxyURL, useSIWC) || !sess.device.identity.CompatibleHandshake(device.identity) {
 			sess.connMu.Unlock()
 			if errClose := closer.Close(); errClose != nil {
 				log.Errorf("codex websockets executor: close competing websocket error: %v", errClose)

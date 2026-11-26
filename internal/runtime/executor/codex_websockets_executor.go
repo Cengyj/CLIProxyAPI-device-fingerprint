@@ -294,6 +294,11 @@ func (e *CodexWebsocketsExecutor) InterruptExecutionSession(ctx context.Context,
 		}
 	}
 	if errWrite := writeCodexWebsocketMessage(sess, conn, payload); errWrite != nil {
+		if devicePolicy.Enabled {
+			// A partial control write may already have exposed its device values.
+			// Retire this socket instead of retaining an uncertain device binding.
+			e.invalidateUpstreamConnWithoutDisconnectNotify(sess, conn, "interrupt_send_error", errWrite)
+		}
 		return errWrite
 	}
 	log.WithField("outcome", "forwarded").Debug("codex websockets: response.interrupt handled")

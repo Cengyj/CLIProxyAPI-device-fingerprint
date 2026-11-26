@@ -26,16 +26,10 @@ func (e *CodexWebsocketsExecutor) prepareSessionInstructions(ctx context.Context
 	if auth != nil {
 		authID = auth.ID
 	}
-	conn, _ := existingWebsocketSessionConn(sess, authID, wsURL, executionProxyURL(ctx, sess.effectiveConfig(authID, e.cfg), auth), useSIWC)
-	// A changed mode cannot provide continuation proof. Final effective values
-	// are checked after user rules, before the old connection can be used.
-	if conn != nil {
-		sess.connMu.Lock()
-		if sess.conn != conn || sess.device.policy.Enabled != devicePolicy.Enabled {
-			conn = nil
-		}
-		sess.connMu.Unlock()
-	}
+	// A changed mode or subject cannot provide continuation proof. Final device
+	// values are checked after user rules, before the connection can be used.
+	device := codexWebsocketDeviceSnapshot{policy: devicePolicy, identity: devicePolicy.Identity(nil, nil)}
+	conn, _ := existingCodexWebsocketSessionConn(sess, authID, wsURL, executionProxyURL(ctx, sess.effectiveConfig(authID, e.cfg), auth), useSIWC, device)
 	return helps.PrepareCodexSessionInstructions(ctx, doc, req, opts, &sess.sessionInstructions, conn, false)
 }
 

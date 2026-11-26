@@ -42,6 +42,14 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 	input <-chan cliproxyexecutor.WebsocketInput, initial *codexWebsocketPrepared,
 	initialReporter *helps.UsageReporter, headers http.Header, unlock func(),
 ) *cliproxyexecutor.StreamResult {
+	// A complete request can reuse a socket because final user overrides keep
+	// its effective identity unchanged. Duplex must still freeze the policy
+	// of that physical socket, not a newly resolved policy masked by overrides.
+	if boundDevice, sameConn := sess.deviceForConn(conn); sameConn {
+		preparedCopy := *initial
+		preparedCopy.device = boundDevice
+		initial = &preparedCopy
+	}
 	streamCtx, cancel := context.WithCancel(ctx)
 	// Duplex successors bypass dispatch, including automatic steering responses.
 	// Reader usage reporting uses ctx so post-cancel failure publishing still has
@@ -594,7 +602,7 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 			if errConn := prepared.sessionInstructions.OnConnection(conn); errConn != nil {
 				return rejectPreviousResponseNotFound(eventID)
 			}
-			if prepared.wsURL != initial.wsURL || prepared.useSIWC != initial.useSIWC || !sess.bindDevice(conn, prepared.device) {
+			if prepared.wsURL != initial.wsURL || (initial.device.policy.Enabled && prepared.useSIWC != initial.useSIWC) || !initial.device.identity.CompatibleHandshake(prepared.device.identity) || !sess.bindDevice(conn, prepared.device) {
 				fail(cliproxyexecutor.NewUpstreamWebsocketReplayRequiredError())
 				return false
 			}
@@ -715,19 +723,23 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 					}
 					steerDoc := ojson.NewDoc(steerReq.Payload)
 					helps.StripCodexSessionInstructionMarker(steerDoc, opts.SourceFormat)
-					if codexUseSIWCForRequest(ctx, auth, steerHeaders) != initial.useSIWC || !e.deviceResolver.CompatibleFrozenAuth(initial.device.policy, auth, initial.useSIWC, initial.wsURL) {
+					steerUseSIWC := codexUseSIWCForRequest(ctx, auth, steerHeaders)
+					if initial.device.policy.Enabled && (steerUseSIWC != initial.useSIWC || !e.deviceResolver.CompatibleFrozenAuth(initial.device.policy, auth, initial.useSIWC, initial.wsURL)) {
 						fail(cliproxyexecutor.NewUpstreamWebsocketReplayRequiredError())
 						return
 					}
-					if initial.useSIWC {
+					if steerUseSIWC {
 						thinking.StripConfigurationUpdatesDoc(steerDoc)
 					}
-					boundDevice, sameConn := sess.deviceForConn(conn)
-					if !sameConn {
-						fail(cliproxyexecutor.NewUpstreamWebsocketReplayRequiredError())
-						return
+					controlPolicy := initial.device.controlPolicy()
+					if initial.device.policy.Enabled {
+						boundDevice, sameConn := sess.deviceForConn(conn)
+						if !sameConn {
+							fail(cliproxyexecutor.NewUpstreamWebsocketReplayRequiredError())
+							return
+						}
+						controlPolicy = boundDevice.controlPolicy()
 					}
-					controlPolicy := boundDevice.controlPolicy()
 					if errDevice := controlPolicy.ValidateInput(steerReq.Payload); errDevice != nil {
 						fail(errDevice)
 						return
@@ -741,7 +753,7 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 					// The event discriminator is transport framing; device fields
 					// have already passed through the final business payload rules.
 					_ = steerDoc.Set("type", "response.steer")
-					steerDevice := codexWebsocketDeviceSnapshot{policy: initial.device.policy, identity: initial.device.policy.Identity(steerDoc, initial.wsHeaders)}
+					steerDevice := codexWebsocketDeviceSnapshot{policy: initial.device.policy, identity: initial.device.policy.Identity(steerDoc, nil)}
 					parent := strings.Clone(steerDoc.Get("previous_response_id").String())
 					steerEventID := strings.Clone(steerDoc.Get("event_id").String())
 					payload = steerDoc.Bytes()

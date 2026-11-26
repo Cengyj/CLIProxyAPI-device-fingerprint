@@ -33,6 +33,8 @@ type CodexDevicePolicy struct {
 	ID            string
 	InjectMissing bool
 	SIWC          bool
+	// credentialSubject binds active sockets independently of administrator-chosen IDs.
+	credentialSubject [32]byte
 }
 
 type codexDeviceAccount struct {
@@ -104,7 +106,9 @@ func (r *CodexDeviceResolver) Resolve(cfg *config.Config, auth *cliproxyauth.Aut
 	if !codexDeviceResponsesURL(targetURL) {
 		return CodexDevicePolicy{}
 	}
-	policy := CodexDevicePolicy{Enabled: true, SIWC: useSIWC}
+	identity := r.accountIdentity(auth)
+	identity = r.remember(strings.TrimSpace(auth.ID), identity)
+	policy := CodexDevicePolicy{Enabled: true, SIWC: useSIWC, credentialSubject: identity.subject(strings.TrimSpace(auth.ID))}
 	if !useSIWC && cfg != nil && cfg.Codex.DeviceFingerprintInjectMissing != nil {
 		policy.InjectMissing = *cfg.Codex.DeviceFingerprintInjectMissing
 	}
@@ -129,6 +133,29 @@ func (r *CodexDeviceResolver) Resolve(cfg *config.Config, auth *cliproxyauth.Aut
 		}
 		r.warn(codexDeviceWarnOverride, "invalid-explicit-device")
 	}
+	if identity.account != "" {
+		switch strings.ToLower(strings.TrimSpace(identity.plan)) {
+		case "team", "business", "enterprise", "edu":
+			if identity.user != "" {
+				policy.ID = codexDeviceUUID("account-user\x00" + identity.account + "\x00" + identity.user)
+				return policy
+			}
+			r.warn(codexDeviceWarnTeamUser, "team-member-missing")
+		default:
+			policy.ID = codexDeviceUUID("account\x00" + identity.account)
+			return policy
+		}
+	}
+	if authID := strings.TrimSpace(auth.ID); authID != "" {
+		r.warn(codexDeviceWarnFallback, "auth-id-fallback")
+		policy.ID = codexDeviceUUID("auth-id\x00" + authID)
+		return policy
+	}
+	return CodexDevicePolicy{}
+}
+
+// accountIdentity reads only explicit metadata and token claims, never parser defaults.
+func (r *CodexDeviceResolver) accountIdentity(auth *cliproxyauth.Auth) codexDeviceAccount {
 	// Match the executor's selected OAuth account header when metadata has it.
 	// Explicit device overrides and mode use the separate Attributes-first rule.
 	account := codexDeviceMetadataString(auth, "account_id")
@@ -139,7 +166,13 @@ func (r *CodexDeviceResolver) Resolve(cfg *config.Config, auth *cliproxyauth.Aut
 	if identity.plan == "" {
 		identity.plan = codexDeviceAuthString(auth, "chatgpt_plan_type")
 	}
-	if token := codexDeviceAuthString(auth, "id_token"); token != "" {
+	// OAuth refresh writes the canonical token to Metadata. An old auxiliary
+	// attribute must not displace that token and lose the current member claims.
+	token := codexDeviceMetadataString(auth, "id_token")
+	if token == "" {
+		token = strings.TrimSpace(auth.Attributes["id_token"])
+	}
+	if token != "" {
 		claims, errParse := codexauth.ParseJWTToken(token)
 		if errParse != nil {
 			r.warn(codexDeviceWarnJWT, "unreadable-id-token")
@@ -160,26 +193,25 @@ func (r *CodexDeviceResolver) Resolve(cfg *config.Config, auth *cliproxyauth.Aut
 			}
 		}
 	}
-	identity = r.remember(strings.TrimSpace(auth.ID), identity)
-	if identity.account != "" {
-		switch strings.ToLower(strings.TrimSpace(identity.plan)) {
+	return identity
+}
+
+// subject deliberately excludes the public installation ID: two administrators
+// may choose one UUID, but a physical authenticated socket still has one subject.
+func (i codexDeviceAccount) subject(authID string) [32]byte {
+	seed := "auth-id\x00" + authID
+	if i.account != "" {
+		seed = "account\x00" + i.account
+		switch strings.ToLower(strings.TrimSpace(i.plan)) {
 		case "team", "business", "enterprise", "edu":
-			if identity.user != "" {
-				policy.ID = codexDeviceUUID("account-user\x00" + identity.account + "\x00" + identity.user)
-				return policy
+			if i.user != "" {
+				seed = "account-user\x00" + i.account + "\x00" + i.user
+			} else {
+				seed = "account-auth\x00" + i.account + "\x00" + authID
 			}
-			r.warn(codexDeviceWarnTeamUser, "team-member-missing")
-		default:
-			policy.ID = codexDeviceUUID("account\x00" + identity.account)
-			return policy
 		}
 	}
-	if authID := strings.TrimSpace(auth.ID); authID != "" {
-		r.warn(codexDeviceWarnFallback, "auth-id-fallback")
-		policy.ID = codexDeviceUUID("auth-id\x00" + authID)
-		return policy
-	}
-	return CodexDevicePolicy{}
+	return sha256.Sum256([]byte(seed))
 }
 
 func codexDeviceAuthString(auth *cliproxyauth.Auth, key string) string {
@@ -209,6 +241,8 @@ func (r *CodexDeviceResolver) remember(key string, identity codexDeviceAccount) 
 			// When the account is absent but a new member is present, we
 			// cannot safely attach that member to the cached workspace.
 			if identity.account == "" && identity.user != "" && identity.user != cached.user {
+				delete(r.entries, key)
+				r.recent.Remove(element)
 				return identity
 			}
 			if identity.account == "" {
@@ -478,15 +512,17 @@ func (p CodexDevicePolicy) ApplyHeaders(headers http.Header) {
 	}
 }
 
-// CodexDeviceIdentity describes only effective device values on the wire.
+// CodexDeviceIdentity describes the authenticated subject and effective device
+// values on the wire, without session, thread, turn, or cache identifiers.
 // Missing values impose no new device identity. Values in different locations
 // remain separate so explicit conflicting administrator rules stay observable.
 type CodexDeviceIdentity struct {
-	Enabled     bool
-	SIWC        bool
-	values      [4]string
-	single      string
-	conflicting bool
+	Enabled           bool
+	SIWC              bool
+	values            [4]string
+	single            string
+	conflicting       bool
+	credentialSubject [32]byte
 }
 
 // EffectiveID reports a single UUID device actually represented by final values.
@@ -501,7 +537,7 @@ func (i CodexDeviceIdentity) EffectiveID() (string, bool) {
 // Identity is read-only and may be called after the final user payload barrier.
 // It intentionally ignores the derived ID when final rules replace every ID.
 func (p CodexDevicePolicy) Identity(doc *ojson.Doc, headers http.Header) CodexDeviceIdentity {
-	identity := CodexDeviceIdentity{Enabled: p.Enabled, SIWC: p.SIWC}
+	identity := CodexDeviceIdentity{Enabled: p.Enabled, SIWC: p.SIWC, credentialSubject: p.credentialSubject}
 	if !p.Enabled {
 		return identity
 	}
@@ -592,6 +628,9 @@ func (i CodexDeviceIdentity) Compatible(other CodexDeviceIdentity) bool {
 	if i.Enabled != other.Enabled || i.SIWC != other.SIWC {
 		return false
 	}
+	if i.Enabled && i.credentialSubject != other.credentialSubject {
+		return false
+	}
 	if !i.conflicting && !other.conflicting && i.single != "" && other.single != "" && i.single != other.single {
 		return false
 	}
@@ -602,7 +641,14 @@ func (i CodexDeviceIdentity) Compatible(other CodexDeviceIdentity) bool {
 	}
 	// A newly present location may repeat an established device, but must not
 	// introduce a third identity into an explicitly conflicting connection.
-	if i.single != "" {
+	if i.single != "" && (i.conflicting || other.conflicting) {
+		newLocation := false
+		for field, value := range other.values {
+			newLocation = newLocation || (i.values[field] == "" && value != "")
+		}
+		if !newLocation {
+			return true
+		}
 		known := make(map[string]bool)
 		for _, value := range i.values {
 			ojson.Get(value, "values").ForEach(func(_, member ojson.Result) bool {
