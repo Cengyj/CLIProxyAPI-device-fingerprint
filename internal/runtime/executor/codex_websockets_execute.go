@@ -176,7 +176,8 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	wsHeaders = applyCodexWebsocketHeaders(ctx, wsHeaders, auth, apiKey, e.cfg, nativeRequest, opts.Headers)
 	applyCodexRoutingHint(ctx, wsHeaders, auth, upstreamModel, body, opts.Headers)
 	applyModelHeaderOverrides(wsHeaders, upstreamModel)
-	device := codexWebsocketDeviceSnapshot{policy: devicePolicy, identity: devicePolicy.Identity(doc, wsHeaders)}
+	helps.FinalizeCodexWebsocketHeaders(wsHeaders)
+	device := codexWebsocketDeviceSnapshot{policy: devicePolicy, identity: devicePolicy.IdentityForHandshake(doc, wsHeaders, apiKey)}
 	if errValidate := helps.ValidateCodexHostedImageGenerationDoc(doc, wsHeaders, e.cfg, !useSIWC && !codexAuthUsesAPIKey(auth)); errValidate != nil {
 		return resp, errValidate
 	}

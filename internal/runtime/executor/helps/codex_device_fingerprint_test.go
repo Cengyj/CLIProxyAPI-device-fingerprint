@@ -188,12 +188,22 @@ func TestCodexDeviceFingerprintAccountStability(t *testing.T) {
 		t.Fatal("token refresh changed identity")
 	}
 	rebuilt := codexDeviceTestAuth("renamed.json", "acc-test-1")
-	if got := resolver.Resolve(cfg, rebuilt, false, codexDeviceTestURL); got != first {
-		t.Fatal("renamed or rebuilt credentials changed identity")
-	}
 	var restarted CodexDeviceResolver
-	if got := restarted.Resolve(cfg, rebuilt, false, codexDeviceTestURL); got != first {
-		t.Fatal("restart changed identity")
+	// Public account UUIDs survive missing claims, but a socket authenticated
+	// for a known member cannot treat an unknown member as the same subject.
+	for _, current := range []*CodexDeviceResolver{&resolver, &restarted} {
+		got := current.Resolve(cfg, rebuilt, false, codexDeviceTestURL)
+		if got.ID != first.ID || got.Enabled != first.Enabled || got.InjectMissing != first.InjectMissing || got.SIWC != first.SIWC {
+			t.Fatal("renamed or restarted credential changed public account device policy")
+		}
+		if first.Identity(nil, nil).CompatibleHandshake(got.Identity(nil, nil)) {
+			t.Fatal("missing member was assumed to own an existing authenticated socket")
+		}
+	}
+	knownMember := rebuilt.Clone()
+	knownMember.Metadata["chatgpt_user_id"] = "user-1"
+	if got := restarted.Resolve(cfg, knownMember, false, codexDeviceTestURL); got != first {
+		t.Fatal("same known member changed identity after restart")
 	}
 	if resolver.Resolve(cfg, codexDeviceTestAuth("second", "acc-test-2"), false, codexDeviceTestURL).ID == first.ID {
 		t.Fatal("different account shared identity")
@@ -274,7 +284,7 @@ func TestCodexDeviceFingerprintCacheBoundAndConcurrency(t *testing.T) {
 	if len(resolver.entries) != codexDeviceCacheLimit || resolver.recent.Len() != codexDeviceCacheLimit {
 		t.Fatal("cache exceeded bound")
 	}
-	if resolver.entries["auth-0"] != nil {
+	if resolver.entries[codexDeviceCacheKey{id: "auth-0"}] != nil {
 		t.Fatal("oldest entry was not evicted")
 	}
 	cfg.Codex.DeviceFingerprintMode = "off"

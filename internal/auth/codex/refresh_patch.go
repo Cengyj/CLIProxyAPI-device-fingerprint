@@ -1,10 +1,16 @@
 package codex
 
-import "reflect"
+import (
+	"bytes"
+	"reflect"
+	"strings"
+
+	"github.com/MoeForge/moego/json"
+)
 
 var codexSIWCCredentialKeys = []string{
 	"access_token", "refresh_token", "id_token", "client_id", "device_id",
-	"expired", "expires_at", "earliest_refresh_at", "last_refresh", "scope", "scopes",
+	"earliest_refresh_at", "last_refresh", "lastRefresh", "scope", "scopes",
 }
 
 // CredentialRefreshPatch is an immutable, partition-specific refresh result.
@@ -17,6 +23,9 @@ type CredentialRefreshPatch struct {
 	siwcBefore           map[string]any
 	siwcDiskBefore       map[string]any
 	siwcAfter            map[string]any
+	siwcRemoved          bool
+	hadDiskBaseline      bool
+	sourceFile           string
 	baselineOuterRefresh string
 	baselineSIWCRefresh  string
 	upstreamRefreshed    bool
@@ -35,28 +44,48 @@ func NewCredentialRefreshPatch(before, after map[string]any, outer, siwc bool) *
 // and the on-disk baseline (diskBefore) observed under the file lock before refreshing to after.
 func NewCredentialRefreshPatchWithDiskBaseline(before, diskBefore, after map[string]any, outer, siwc bool) *CredentialRefreshPatch {
 	patch := &CredentialRefreshPatch{
+		hadDiskBaseline:      diskBefore != nil,
 		upstreamRefreshed:    outer || siwc,
 		baselineOuterRefresh: lookupRefreshTokenField(diskBefore, before, false),
 		baselineSIWCRefresh:  lookupRefreshTokenField(diskBefore, before, true),
 	}
 	if outer {
-		patch.outerBefore = credentialFields(before, codexOuterCredentialKeys)
+		patch.outerBefore = outerCredentialFields(before)
 		if len(diskBefore) > 0 {
-			patch.outerDiskBefore = credentialFields(diskBefore, codexOuterCredentialKeys)
+			patch.outerDiskBefore = outerCredentialFields(diskBefore)
 		}
-		patch.outerAfter = credentialFields(after, codexOuterCredentialKeys)
+		patch.outerAfter = outerCredentialFields(after)
 	}
 	if siwc {
 		beforeSIWC, _ := before["siwc"].(map[string]any)
 		diskBeforeSIWC, _ := diskBefore["siwc"].(map[string]any)
 		afterSIWC, _ := after["siwc"].(map[string]any)
-		patch.siwcBefore = credentialFields(beforeSIWC, codexSIWCCredentialKeys)
+		patch.siwcBefore = siwcCredentialFields(beforeSIWC)
 		if len(diskBeforeSIWC) > 0 {
-			patch.siwcDiskBefore = credentialFields(diskBeforeSIWC, codexSIWCCredentialKeys)
+			patch.siwcDiskBefore = siwcCredentialFields(diskBeforeSIWC)
 		}
-		patch.siwcAfter = credentialFields(afterSIWC, codexSIWCCredentialKeys)
+		patch.siwcAfter = siwcCredentialFields(afterSIWC)
+		_, hasSIWCAfter := after["siwc"]
+		patch.siwcRemoved = !hasSIWCAfter
 	}
 	return patch
+}
+
+// WithSourceFile binds a snapshot to its original source without changing the
+// shared patch. Saving an accepted snapshot to a new destination remains allowed.
+func (p *CredentialRefreshPatch) WithSourceFile(path string) *CredentialRefreshPatch {
+	if p == nil || strings.TrimSpace(path) == "" {
+		return p
+	}
+	cloned := *p
+	cloned.sourceFile = canonicalLockPath(path)
+	return &cloned
+}
+
+// RequiresExistingFile prevents a late refresh save from recreating its removed
+// source. Legacy patches without a source path conservatively require a file.
+func (p *CredentialRefreshPatch) RequiresExistingFile(path string) bool {
+	return p != nil && p.hadDiskBaseline && (p.sourceFile == "" || p.sourceFile == canonicalLockPath(path))
 }
 
 func lookupRefreshTokenField(diskBefore, memBefore map[string]any, siwc bool) string {
@@ -89,6 +118,44 @@ func credentialFields(metadata map[string]any, keys []string) map[string]any {
 	return cloneStringAnyMap(fields)
 }
 
+func siwcCredentialFields(siwc map[string]any) map[string]any {
+	fields := credentialFields(siwc, codexSIWCCredentialKeys)
+	ReplaceExpirationFields(fields, siwc)
+	if token := SIWCAccessToken(siwc); token != "" {
+		fields["access_token"] = token
+	}
+	return fields
+}
+
+func outerCredentialFields(metadata map[string]any) map[string]any {
+	fields := credentialFields(metadata, codexOuterCredentialKeys)
+	ReplaceExpirationFields(fields, metadata)
+	return fields
+}
+
+// SameOuterCredentialSnapshot compares the fields owned by the outer credential,
+// excluding administrator settings and unrelated data in legacy token containers.
+func SameOuterCredentialSnapshot(a, b map[string]any) bool {
+	return sameCredentialSnapshot(outerCredentialFields(a), outerCredentialFields(b))
+}
+
+// SameSIWCCredentialSnapshot includes renewal, identity and registration fields,
+// even when a disk edit keeps both token strings unchanged.
+func SameSIWCCredentialSnapshot(a, b map[string]any) bool {
+	return sameCredentialSnapshot(siwcCredentialFields(a), siwcCredentialFields(b))
+}
+
+func sameCredentialSnapshot(a, b map[string]any) bool {
+	if reflect.DeepEqual(a, b) {
+		return true
+	}
+	// Disk decoding represents numbers differently from typed login metadata.
+	// Compare their JSON values to avoid inventing a rotation after a round trip.
+	aJSON, errA := json.Marshal(a)
+	bJSON, errB := json.Marshal(b)
+	return errA == nil && errB == nil && bytes.Equal(aJSON, bJSON)
+}
+
 func sameCredentialVersion(a, b map[string]any) bool {
 	for _, key := range []string{"access_token", "refresh_token", "id_token", "account_id", "client_id", "device_id"} {
 		if !reflect.DeepEqual(a[key], b[key]) {
@@ -99,27 +166,38 @@ func sameCredentialVersion(a, b map[string]any) bool {
 }
 
 func matchesBaselineOrAfter(target, memBefore, diskBefore, after map[string]any) (matched bool, effectiveBefore map[string]any) {
-	if len(diskBefore) > 0 && sameCredentialVersion(target, diskBefore) {
+	matches := func(baseline map[string]any) bool {
+		if !sameCredentialVersion(target, baseline) {
+			return false
+		}
+		// When token identity did not change, token strings alone cannot order
+		// sparse renewals. Keep a newer expiry or registration snapshot intact.
+		return !sameCredentialVersion(baseline, after) || sameCredentialSnapshot(target, baseline)
+	}
+	if len(diskBefore) > 0 && matches(diskBefore) {
 		return true, diskBefore
 	}
-	if sameCredentialVersion(target, memBefore) {
+	if matches(memBefore) {
 		return true, memBefore
 	}
-	if len(after) > 0 && sameCredentialVersion(target, after) {
+	if len(after) > 0 && sameCredentialSnapshot(target, after) {
 		return true, after
 	}
 	return false, nil
 }
 
-func applyCredentialFields(disk, before, after map[string]any) {
+func applyCredentialFields(disk, before, after map[string]any, clearMissing []string) {
 	for key, value := range after {
+		if IsCodexExpirationKey(key) {
+			continue
+		}
 		// Preserve fields changed on disk that the refresh did not modify.
 		oldValue, existed := before[key]
 		if !existed || !reflect.DeepEqual(oldValue, value) {
 			disk[key] = value
 		}
 	}
-	for _, key := range []string{"expires_at", "earliest_refresh_at", "chatgpt_user_id", "chatgpt_plan_type"} {
+	for _, key := range clearMissing {
 		if _, had := before[key]; had {
 			if _, has := after[key]; !has {
 				delete(disk, key)
@@ -131,11 +209,11 @@ func applyCredentialFields(disk, before, after map[string]any) {
 // IsCodexCredentialKey reports whether key belongs to a Codex credential partition or switch
 // managed by CredentialRefreshPatch.
 func IsCodexCredentialKey(key string) bool {
-	if key == "siwc" || key == "use_siwc" {
+	if key == "siwc" || key == "use_siwc" || IsCodexExpirationKey(key) {
 		return true
 	}
 	for _, k := range codexOuterCredentialKeys {
-		if k == key {
+		if strings.EqualFold(k, key) {
 			return true
 		}
 	}
@@ -210,6 +288,14 @@ func (p *CredentialRefreshPatch) FailedSIWCRefreshToken() string {
 	return p.baselineSIWCRefresh
 }
 
+// SetFailedSIWCRefreshToken records the grant actually submitted after adopting
+// a rotated Home grant within the same partition refresh.
+func (p *CredentialRefreshPatch) SetFailedSIWCRefreshToken(token string) {
+	if p != nil && p.siwcErr != nil {
+		p.baselineSIWCRefresh = strings.TrimSpace(token)
+	}
+}
+
 // PartitionRefreshError carries per-partition refresh errors when a credential refresh fails.
 type PartitionRefreshError struct {
 	outerErr error
@@ -279,7 +365,17 @@ func (p *CredentialRefreshPatch) CanApplyOuterTo(target map[string]any) bool {
 	if p == nil || p.outerAfter == nil {
 		return false
 	}
-	matched, _ := matchesBaselineOrAfter(target, p.outerBefore, p.outerDiskBefore, p.outerAfter)
+	matched, _ := matchesBaselineOrAfter(outerCredentialFields(target), p.outerBefore, p.outerDiskBefore, p.outerAfter)
+	return matched
+}
+
+// CanApplySIWCTo reports whether the refreshed nested partition matches the target version.
+func (p *CredentialRefreshPatch) CanApplySIWCTo(target map[string]any) bool {
+	if p == nil || p.siwcAfter == nil {
+		return false
+	}
+	siwc, _ := target["siwc"].(map[string]any)
+	matched, _ := matchesBaselineOrAfter(siwcCredentialFields(siwc), p.siwcBefore, p.siwcDiskBefore, p.siwcAfter)
 	return matched
 }
 
@@ -289,13 +385,13 @@ func (p *CredentialRefreshPatch) CanApplyTo(disk map[string]any) bool {
 		return false
 	}
 	if p.outerAfter != nil {
-		if ok, _ := matchesBaselineOrAfter(disk, p.outerBefore, p.outerDiskBefore, p.outerAfter); ok {
+		if ok, _ := matchesBaselineOrAfter(outerCredentialFields(disk), p.outerBefore, p.outerDiskBefore, p.outerAfter); ok {
 			return true
 		}
 	}
 	diskSIWC, _ := disk["siwc"].(map[string]any)
 	if p.siwcAfter != nil {
-		if ok, _ := matchesBaselineOrAfter(diskSIWC, p.siwcBefore, p.siwcDiskBefore, p.siwcAfter); ok {
+		if ok, _ := matchesBaselineOrAfter(siwcCredentialFields(diskSIWC), p.siwcBefore, p.siwcDiskBefore, p.siwcAfter); ok {
 			return true
 		}
 	}
@@ -310,12 +406,14 @@ func (p *CredentialRefreshPatch) Apply(disk map[string]any) map[string]any {
 		merged = make(map[string]any)
 	}
 	if p.outerAfter != nil {
-		if ok, base := matchesBaselineOrAfter(disk, p.outerBefore, p.outerDiskBefore, p.outerAfter); ok {
-			applyCredentialFields(merged, base, p.outerAfter)
-			// Identity hints belong to the adopted credential snapshot, including
-			// unchanged and absent fields. Independent administrator edits survive.
+		if ok, base := matchesBaselineOrAfter(outerCredentialFields(disk), p.outerBefore, p.outerDiskBefore, p.outerAfter); ok {
+			after := cloneStringAnyMap(p.outerAfter)
+			applyCredentialFields(merged, base, after, RefreshTimeMetadataKeys())
+			ReplaceExpirationFields(merged, after)
+			// Identity hints belong to the adopted credential snapshot,
+			// including unchanged and absent fields.
 			for _, key := range []string{"account_id", "id_token", "chatgpt_user_id", "chatgpt_plan_type", "plan_type", "plan_type_defaulted"} {
-				if value, exists := p.outerAfter[key]; exists {
+				if value, exists := after[key]; exists {
 					merged[key] = value
 				} else {
 					delete(merged, key)
@@ -325,12 +423,24 @@ func (p *CredentialRefreshPatch) Apply(disk map[string]any) map[string]any {
 	}
 	diskSIWC, _ := disk["siwc"].(map[string]any)
 	if p.siwcAfter != nil {
-		if ok, base := matchesBaselineOrAfter(diskSIWC, p.siwcBefore, p.siwcDiskBefore, p.siwcAfter); ok {
+		if ok, base := matchesBaselineOrAfter(siwcCredentialFields(diskSIWC), p.siwcBefore, p.siwcDiskBefore, p.siwcAfter); ok {
+			if p.siwcRemoved {
+				delete(merged, "siwc")
+				return merged
+			}
 			mergedSIWC := cloneStringAnyMap(diskSIWC)
 			if mergedSIWC == nil {
 				mergedSIWC = make(map[string]any)
 			}
-			applyCredentialFields(mergedSIWC, base, p.siwcAfter)
+			NormalizeSIWCAccessToken(mergedSIWC)
+			// Applied snapshots are independently editable; they must never
+			// expose the immutable patch's maps or registration slices.
+			after := cloneStringAnyMap(p.siwcAfter)
+			applyCredentialFields(mergedSIWC, base, after, []string{"earliest_refresh_at", "last_refresh", "lastRefresh"})
+			ReplaceExpirationFields(mergedSIWC, after)
+			if _, hasID := after["id_token"]; !hasID && SIWCAccessToken(base) != SIWCAccessToken(after) {
+				delete(mergedSIWC, "id_token")
+			}
 			merged["siwc"] = mergedSIWC
 		}
 	}

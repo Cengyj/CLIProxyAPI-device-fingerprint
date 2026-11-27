@@ -1,13 +1,72 @@
 package helps
 
 import (
+	"crypto/sha256"
 	"net/http"
 	"slices"
 	"strings"
 
+	"github.com/MoeForge/moego/json"
+	"github.com/MoeForge/moego/ojson"
+	codexauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth/codex"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 )
+
+// IdentityForHandshake binds final authentication headers after administrator
+// overrides. Controls have no handshake and continue to use Identity. Only
+// digests are retained; normal selected-token renewal uses the subject guard,
+// while opaque custom credentials cannot claim that same renewal contract.
+func (p CodexDevicePolicy) IdentityForHandshake(doc *ojson.Doc, headers http.Header, selectedBearer string) CodexDeviceIdentity {
+	identity := p.Identity(doc, headers)
+	if !p.Enabled || headers == nil {
+		return identity
+	}
+	var keys []string
+	for key := range headers {
+		if strings.EqualFold(key, "Authorization") || strings.EqualFold(key, "ChatGPT-Account-ID") {
+			keys = append(keys, key)
+		}
+	}
+	slices.Sort(keys)
+	type authHeaderValue struct {
+		Name  string
+		Value [32]byte
+	}
+	var values []authHeaderValue
+	for _, key := range keys {
+		for _, value := range headers[key] {
+			value = strings.TrimSpace(value)
+			kind := strings.ToLower(key)
+			var digest [32]byte
+			if strings.EqualFold(key, "Authorization") && len(value) >= len("Bearer ") && strings.EqualFold(value[:len("Bearer ")], "Bearer ") {
+				bearer := strings.TrimSpace(value[len("Bearer "):])
+				if subject, known := codexauth.ParseJWTSubject(bearer); known {
+					encoded, _ := json.Marshal(subject)
+					digest = sha256.Sum256(encoded)
+					kind += ":subject"
+				} else if bearer == strings.TrimSpace(selectedBearer) {
+					digest = p.credentialSubject
+					kind += ":selected"
+				} else {
+					digest = sha256.Sum256([]byte(value))
+				}
+			} else {
+				digest = sha256.Sum256([]byte(value))
+			}
+			values = append(values, authHeaderValue{Name: kind, Value: digest})
+		}
+	}
+	// Header-name casing cannot change authentication. Preserve the actual
+	// value order within one header, but normalize order across header names.
+	slices.SortStableFunc(values, func(a, b authHeaderValue) int {
+		return strings.Compare(a.Name, b.Name)
+	})
+	encoded, _ := json.Marshal(values)
+	identity.handshakeAuth = sha256.Sum256(encoded)
+	identity.hasHandshakeAuth = true
+	return identity
+}
 
 // CompatibleHandshake checks a candidate handshake against the headers actually
 // sent on a retained socket. A newly requested device header needs a new socket;

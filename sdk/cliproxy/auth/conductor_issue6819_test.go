@@ -697,3 +697,47 @@ func TestCodexClient401OnSIWCAuthRejectsAndRefreshesOuterTokenOnly(t *testing.T)
 		t.Fatal("expected Codex client result with current outer token not to be treated as stale when only SIWC token rotated")
 	}
 }
+
+func TestCodexSIWCLegacyBearerScheduling(t *testing.T) {
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	realExpiry := now.Add(time.Hour)
+	bearer := makeIssue6742JWT(realExpiry)
+	a := &Auth{Provider: "codex", Metadata: map[string]any{
+		"use_siwc": true, "siwc": map[string]any{"access": bearer, "refresh_token": "grant", "client_id": "client"},
+	}}
+	if got := a.CodexSIWCStatus(now); got != SIWCStatusValid {
+		t.Errorf("legacy SIWC status = %s, want valid", got)
+	}
+	if next, has, due := CodexSIWCNeedsRefresh(a, now); !has || due || !next.Equal(realExpiry.Add(-CodexSIWCRefreshLead)) {
+		t.Errorf("legacy SIWC due=%t at %v, has grant=%t", due, next, has)
+	}
+	a.RejectedSIWCAccessToken = bearer
+	if got := a.CodexSIWCStatus(now); got != SIWCStatusInvalid {
+		t.Errorf("rejected legacy SIWC status = %s, want invalid", got)
+	}
+	if _, has, due := CodexSIWCNeedsRefresh(a, now); !has || !due {
+		t.Error("rejected legacy SIWC bearer did not trigger renewal")
+	}
+}
+
+func TestCodexRenewalExpirationPartitions(t *testing.T) {
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	outerExpiry, siwcExpiry := now.Add(10*24*time.Hour), now.Add(time.Hour)
+	for _, key := range []string{"expired", "expire", "expires_at", "expiresAt", "expiry", "expires"} {
+		t.Run(key, func(t *testing.T) {
+			a := &Auth{Provider: "codex", Metadata: map[string]any{
+				"access_token": makeIssue6742JWT(outerExpiry), "refresh_token": "outer-grant", key: now.Add(-time.Hour).Format(time.RFC3339),
+				"use_siwc": true, "siwc": map[string]any{"access": "opaque-siwc", "refresh_token": "siwc-grant", "client_id": "client", "expires_at": siwcExpiry.Format(time.RFC3339)},
+			}}
+			if expiry, ok := a.OuterExpirationTime(); !ok || !expiry.Equal(outerExpiry) {
+				t.Error("stored expiry displaced the real outer JWT expiry")
+			}
+			if due, has, refresh := CodexOuterNeedsRefresh(a, now); !has || refresh || !due.Equal(outerExpiry.Add(-CodexOuterRefreshLead)) {
+				t.Error("outer partition lost its independent renewal window")
+			}
+			if due, has, refresh := CodexSIWCNeedsRefresh(a, now); !has || refresh || !due.Equal(siwcExpiry.Add(-CodexSIWCRefreshLead)) {
+				t.Error("SIWC partition lost its independent renewal window")
+			}
+		})
+	}
+}

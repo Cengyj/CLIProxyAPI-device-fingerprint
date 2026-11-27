@@ -41,6 +41,12 @@ func PersistCodexAuthFile(ctx context.Context, path string, auth *Auth) (bool, e
 	type metadataSetter interface {
 		SetMetadata(map[string]any)
 	}
+	// Source provenance assigned by loading or saving identifies an established file.
+	// Runtime result updates must not undo an operator's file deletion while its
+	// watcher event is still pending. Initial persistence and login may create it.
+	requireExisting := !HasAuthCreationIntent(ctx) &&
+		strings.TrimSpace(auth.Attributes[AttributePath]) != "" &&
+		(strings.TrimSpace(auth.Attributes[AttributeSourceBackend]) != "" || strings.TrimSpace(auth.Attributes[AttributeSource]) != "" || auth.HasFileSnapshot())
 
 	switch {
 	case auth.CodexRefreshPatch != nil:
@@ -48,6 +54,9 @@ func PersistCodexAuthFile(ctx context.Context, path string, auth *Auth) (bool, e
 			existing, errRead := os.ReadFile(path)
 			if errRead != nil {
 				if os.IsNotExist(errRead) {
+					if requireExisting || auth.CodexRefreshPatch.RequiresExistingFile(path) {
+						return fmt.Errorf("auth filestore: refresh source removed: %w", errRead)
+					}
 					if auth.Metadata == nil {
 						auth.Metadata = make(map[string]any)
 					}
@@ -81,6 +90,11 @@ func PersistCodexAuthFile(ctx context.Context, path string, auth *Auth) (bool, e
 		return true, nil
 
 	case auth.Storage != nil:
+		if requireExisting {
+			if _, errStat := os.Stat(path); errStat != nil {
+				return true, fmt.Errorf("auth filestore: stat credential source: %w", errStat)
+			}
+		}
 		if auth.Metadata == nil {
 			auth.Metadata = make(map[string]any)
 		}
@@ -88,6 +102,10 @@ func PersistCodexAuthFile(ctx context.Context, path string, auth *Auth) (bool, e
 		if storage, ok := auth.Storage.(*codex.CodexTokenStorage); ok && storage != nil {
 			clonedStorage := *storage
 			clonedStorage.ReplaceCredentials = HasAuthCreationIntent(ctx)
+			clonedStorage.ExistingFilePath = ""
+			if requireExisting {
+				clonedStorage.ExistingFilePath = path
+			}
 			auth.Storage = &clonedStorage
 		}
 		if setter, ok := auth.Storage.(metadataSetter); ok {
@@ -105,6 +123,7 @@ func PersistCodexAuthFile(ctx context.Context, path string, auth *Auth) (bool, e
 				if _, ok := auth.Storage.(*codex.CodexTokenStorage); ok {
 					var savedStorage codex.CodexTokenStorage
 					if errDecode := json.Unmarshal(persistedBytes, &savedStorage); errDecode == nil {
+						savedStorage.ExistingFilePath = path
 						savedStorage.SetMetadata(auth.Metadata)
 						auth.Storage = &savedStorage
 					}
@@ -117,9 +136,16 @@ func PersistCodexAuthFile(ctx context.Context, path string, auth *Auth) (bool, e
 		auth.Metadata["disabled"] = auth.Disabled
 		errLock := codex.WithFileLock(path, func() error {
 			existing, errRead := os.ReadFile(path)
-			if errRead == nil && len(existing) > 0 {
+			if os.IsNotExist(errRead) && requireExisting {
+				return fmt.Errorf("auth filestore: credential source removed: %w", errRead)
+			}
+			if errRead == nil {
 				var diskMap map[string]any
-				if errUnmarshal := json.Unmarshal(existing, &diskMap); errUnmarshal == nil && len(diskMap) > 0 {
+				errUnmarshal := json.Unmarshal(existing, &diskMap)
+				if requireExisting && (errUnmarshal != nil || len(diskMap) == 0) {
+					return fmt.Errorf("auth filestore: invalid credential source JSON")
+				}
+				if errUnmarshal == nil && len(diskMap) > 0 {
 					if !HasAuthCreationIntent(ctx) {
 						auth.Metadata = codex.MergeCodexCredentialsFromDisk(diskMap, auth.Metadata)
 					}
@@ -156,6 +182,9 @@ func synchronizeCodexIdentityAttributes(auth *Auth) {
 		attributes[key] = value
 	}
 	auth.Attributes = attributes
+	for _, key := range codex.RefreshTimeMetadataKeys() {
+		delete(auth.Attributes, key)
+	}
 	for _, key := range []string{"account_id", "id_token", "chatgpt_user_id", "chatgpt_plan_type", "plan_type", "plan_type_defaulted"} {
 		delete(auth.Attributes, key)
 		if value, ok := auth.Metadata[key].(string); ok && strings.TrimSpace(value) != "" {

@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/MoeForge/moego/json"
 	"github.com/MoeForge/moego/ojson"
 	"github.com/google/uuid"
 	codexauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth/codex"
@@ -47,9 +48,16 @@ func (i codexDeviceAccount) clone() codexDeviceAccount {
 	return codexDeviceAccount{account: strings.Clone(i.account), user: strings.Clone(i.user), plan: strings.Clone(i.plan)}
 }
 
+type codexDeviceCacheKey struct {
+	id                string
+	registrationEpoch uint64
+}
+
 type codexDeviceCacheEntry struct {
-	key      string
-	identity codexDeviceAccount
+	key               codexDeviceCacheKey
+	identity          codexDeviceAccount
+	credentialVersion uint64
+	generation        uint64
 }
 
 // CodexDeviceResolver retains at most 512 recent auth identities in one executor.
@@ -57,9 +65,13 @@ type codexDeviceCacheEntry struct {
 // Eviction or a restart can lose missing-field recovery; explicit IDs avoid it.
 type CodexDeviceResolver struct {
 	mu       sync.Mutex
-	entries  map[string]*list.Element
+	entries  map[codexDeviceCacheKey]*list.Element
 	recent   list.List
 	warnings uint32
+	// An evicted ordering fence must not be reconstructed by a late snapshot.
+	// This fixed-size history has no false negatives; collisions only disable
+	// cross-version recovery, which follows the documented cold-start fallback.
+	evicted [1024]uint64
 }
 
 const (
@@ -107,13 +119,22 @@ func (r *CodexDeviceResolver) Resolve(cfg *config.Config, auth *cliproxyauth.Aut
 		return CodexDevicePolicy{}
 	}
 	identity := r.accountIdentity(auth)
-	identity = r.remember(strings.TrimSpace(auth.ID), identity)
-	policy := CodexDevicePolicy{Enabled: true, SIWC: useSIWC, credentialSubject: identity.subject(strings.TrimSpace(auth.ID))}
+	_, accountPresent := auth.Metadata["account_id"]
+	_, tokenPresent := auth.Metadata["id_token"]
+	_, memberPresent := auth.Metadata["chatgpt_user_id"]
+	memberCleared := memberPresent && codexDeviceMetadataString(auth, "chatgpt_user_id") == ""
+	key := codexDeviceCacheKey{id: strings.TrimSpace(auth.ID), registrationEpoch: auth.RegistrationEpoch}
+	identity = r.remember(key, auth.CredentialVersion, auth.Generation, identity, accountPresent && tokenPresent && identity.account == "", memberCleared)
+	policy := CodexDevicePolicy{Enabled: true, SIWC: useSIWC, credentialSubject: identity.subject(auth)}
 	if !useSIWC && cfg != nil && cfg.Codex.DeviceFingerprintInjectMissing != nil {
 		policy.InjectMissing = *cfg.Codex.DeviceFingerprintInjectMissing
 	}
 	if useSIWC {
 		if siwc, ok := auth.Metadata["siwc"].(map[string]any); ok {
+			if bearer := codexauth.SIWCAccessToken(siwc); bearer != "" {
+				idToken, _ := siwc["id_token"].(string)
+				policy.credentialSubject = codexSIWCSocketSubject(bearer, idToken)
+			}
 			if raw, okID := siwc["device_id"].(string); okID && strings.TrimSpace(raw) != "" {
 				if id, valid := codexDeviceValidUUID(raw); valid {
 					policy.ID = id
@@ -154,22 +175,61 @@ func (r *CodexDeviceResolver) Resolve(cfg *config.Config, auth *cliproxyauth.Aut
 	return CodexDevicePolicy{}
 }
 
+// Bind only the selected SIWC credentials. A bearer that names its issuer,
+// subject, workspace and member owns the socket identity. A consistent optional
+// ID token must not change that identity by being omitted on a normal renewal.
+func codexSIWCSocketSubject(bearer, idToken string) [32]byte {
+	subjects, hasSubject := codexSocketTokenSubjects(bearer, idToken)
+	// The tuple has only string fields. Its encoding preserves claim boundaries.
+	identity, _ := json.Marshal(subjects)
+	// With no identifiable member, only the same bearer can reuse the socket.
+	// Still include any known workspace so two workspace selections stay apart.
+	if !hasSubject {
+		bearerDigest := sha256.Sum256([]byte(bearer))
+		identity = append(identity, bearerDigest[:]...)
+	}
+	return sha256.Sum256(identity)
+}
+
+func codexSocketTokenSubjects(bearer, idToken string) ([2]codexauth.JWTSubject, bool) {
+	access, hasAccessSubject := codexauth.ParseJWTSubject(bearer)
+	id, hasIDSubject := codexauth.ParseJWTSubject(strings.TrimSpace(idToken))
+	complete := access.Issuer != "" && access.Subject != "" && access.Account != "" && access.User != ""
+	consistent := (id.Issuer == "" || id.Issuer == access.Issuer) &&
+		(id.Subject == "" || id.Subject == access.Subject) &&
+		(id.Account == "" || id.Account == access.Account) &&
+		(id.User == "" || id.User == access.User)
+	if complete && consistent {
+		id = codexauth.JWTSubject{}
+	}
+	// Incomplete or conflicting claims retain both tokens' identity dimensions.
+	return [2]codexauth.JWTSubject{access, id}, hasAccessSubject || hasIDSubject
+}
+
 // accountIdentity reads only explicit metadata and token claims, never parser defaults.
 func (r *CodexDeviceResolver) accountIdentity(auth *cliproxyauth.Auth) codexDeviceAccount {
 	// Match the executor's selected OAuth account header when metadata has it.
 	// Explicit device overrides and mode use the separate Attributes-first rule.
 	account := codexDeviceMetadataString(auth, "account_id")
-	if account == "" {
+	if _, present := auth.Metadata["account_id"]; !present {
 		account = strings.TrimSpace(auth.Attributes["account_id"])
 	}
-	identity := codexDeviceAccount{account: account, user: codexDeviceAuthString(auth, "chatgpt_user_id"), plan: codexDevicePlanType(auth)}
+	// Member hints are credential-owned too. A direct SDK update may leave
+	// auxiliary attributes behind until the next persistence boundary.
+	user := codexDeviceMetadataString(auth, "chatgpt_user_id")
+	if _, present := auth.Metadata["chatgpt_user_id"]; !present {
+		user = strings.TrimSpace(auth.Attributes["chatgpt_user_id"])
+	}
+	identity := codexDeviceAccount{account: account, user: user, plan: codexDevicePlanType(auth)}
+	_, memberPresent := auth.Metadata["chatgpt_user_id"]
+	memberCleared := memberPresent && codexDeviceMetadataString(auth, "chatgpt_user_id") == ""
 	if identity.plan == "" {
 		identity.plan = codexDeviceAuthString(auth, "chatgpt_plan_type")
 	}
 	// OAuth refresh writes the canonical token to Metadata. An old auxiliary
-	// attribute must not displace that token and lose the current member claims.
+	// attribute must not displace it, including an explicit canonical clear.
 	token := codexDeviceMetadataString(auth, "id_token")
-	if token == "" {
+	if _, present := auth.Metadata["id_token"]; !present {
 		token = strings.TrimSpace(auth.Attributes["id_token"])
 	}
 	if token != "" {
@@ -183,7 +243,7 @@ func (r *CodexDeviceResolver) accountIdentity(auth *cliproxyauth.Auth) codexDevi
 			}
 			// A token from an old account must never contribute its member or plan.
 			if claimAccount == "" || claimAccount == identity.account {
-				if identity.user == "" {
+				if identity.user == "" && !memberCleared {
 					identity.user = strings.TrimSpace(claims.CodexAuthInfo.ChatgptUserID)
 				}
 				// GetPlanType supplies a default; only explicit claims identify a plan.
@@ -198,24 +258,60 @@ func (r *CodexDeviceResolver) accountIdentity(auth *cliproxyauth.Auth) codexDevi
 
 // subject deliberately excludes the public installation ID: two administrators
 // may choose one UUID, but a physical authenticated socket still has one subject.
-func (i codexDeviceAccount) subject(authID string) [32]byte {
-	seed := "auth-id\x00" + authID
-	if i.account != "" {
-		seed = "account\x00" + i.account
-		switch strings.ToLower(strings.TrimSpace(i.plan)) {
-		case "team", "business", "enterprise", "edu":
-			if i.user != "" {
-				seed = "account-user\x00" + i.account + "\x00" + i.user
-			} else {
-				seed = "account-auth\x00" + i.account + "\x00" + authID
+func (i codexDeviceAccount) subject(auth *cliproxyauth.Auth) [32]byte {
+	bearer := codexDeviceMetadataString(auth, "access_token")
+	idToken := codexDeviceMetadataString(auth, "id_token")
+	if _, present := auth.Metadata["id_token"]; !present {
+		idToken = strings.TrimSpace(auth.Attributes["id_token"])
+	}
+	tokens, hasSubject := codexSocketTokenSubjects(bearer, idToken)
+	member := i.user
+	if member == "" {
+		for _, token := range tokens {
+			if token.User != "" && (token.Account == "" || token.Account == i.account) {
+				member = token.User
+				break
 			}
 		}
 	}
-	return sha256.Sum256([]byte(seed))
+	// Resolved account/member metadata and matching claims describe the same
+	// dimensions. Canonicalize duplicates so sparse metadata recovery does not
+	// depend on which token originally supplied them.
+	for index := range tokens {
+		if tokens[index].Account == i.account {
+			tokens[index].Account = ""
+		}
+		if tokens[index].User == member {
+			tokens[index].User = ""
+		}
+	}
+	identity := struct {
+		Account string
+		User    string
+		Tokens  [2]codexauth.JWTSubject
+		Opaque  [32]byte
+	}{Account: i.account, User: member, Tokens: tokens}
+	// Legacy OAuth metadata can identify an account without parseable tokens.
+	// Keep its renewal contract, but an entirely unknown subject cannot borrow
+	// the record ID to keep a different bearer on an authenticated socket.
+	if i.account == "" && i.user == "" && !hasSubject {
+		identity.Opaque = sha256.Sum256([]byte(bearer))
+	}
+	encoded, _ := json.Marshal(identity)
+	return sha256.Sum256(encoded)
 }
 
 // codexDevicePlanType ignores only a documented default, preserving explicit free.
 func codexDevicePlanType(auth *cliproxyauth.Auth) string {
+	// A cleared canonical plan is persisted as a fallback plus an empty claim
+	// alias. It blocks an older retained ID token or cache from reviving a plan.
+	if raw, present := auth.Metadata["chatgpt_plan_type"]; present {
+		claimPlan, _ := raw.(string)
+		defaulted, _ := auth.Metadata["plan_type_defaulted"].(bool)
+		if strings.TrimSpace(claimPlan) == "" && defaulted && codexDeviceMetadataString(auth, "plan_type") == codexauth.DefaultPlanType {
+			return codexauth.DefaultPlanType
+		}
+	}
 	if plan := strings.TrimSpace(auth.Attributes["plan_type"]); plan != "" {
 		defaulted := strings.EqualFold(strings.TrimSpace(auth.Attributes["plan_type_defaulted"]), "true")
 		if !defaulted || !strings.EqualFold(plan, codexauth.DefaultPlanType) {
@@ -242,51 +338,103 @@ func codexDeviceMetadataString(auth *cliproxyauth.Auth, key string) string {
 	return strings.TrimSpace(value)
 }
 
-func (r *CodexDeviceResolver) remember(key string, identity codexDeviceAccount) codexDeviceAccount {
-	if r == nil || key == "" {
+func (r *CodexDeviceResolver) remember(key codexDeviceCacheKey, version, generation uint64, identity codexDeviceAccount, clearedAccount, clearedMember bool) codexDeviceAccount {
+	if r == nil || key.id == "" {
 		return identity
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.entries == nil {
-		r.entries = make(map[string]*list.Element)
+		r.entries = make(map[codexDeviceCacheKey]*list.Element)
 	}
 	if element := r.entries[key]; element != nil {
-		cached := element.Value.(codexDeviceCacheEntry).identity
+		entry := element.Value.(codexDeviceCacheEntry)
+		// Direct SDK/file snapshots have no runtime ordering. Versioned Manager
+		// snapshots must neither borrow newer hints nor displace their fence.
+		ordered := version != 0 || generation != 0
+		older := version < entry.credentialVersion || version == entry.credentialVersion && generation < entry.generation
+		if ordered && older {
+			return identity
+		}
+		if !ordered {
+			version, generation = entry.credentialVersion, entry.generation
+		}
+		different := version != entry.credentialVersion || generation != entry.generation
+		if clearedAccount || different && r.wasEvicted(key) {
+			cachedIdentity := identity
+			if clearedAccount {
+				cachedIdentity = codexDeviceAccount{}
+			}
+			r.storeIdentityLocked(element, key, version, generation, cachedIdentity)
+			return identity
+		}
+		cached := entry.identity
 		if identity.account == "" || identity.account == cached.account {
 			// When the account is absent but a new member is present, we
 			// cannot safely attach that member to the cached workspace.
 			if identity.account == "" && identity.user != "" && identity.user != cached.user {
-				delete(r.entries, key)
-				r.recent.Remove(element)
+				r.storeIdentityLocked(element, key, version, generation, codexDeviceAccount{})
 				return identity
 			}
 			if identity.account == "" {
 				identity.account = cached.account
 			}
 			planChanged := identity.plan != "" && cached.plan != "" && !strings.EqualFold(identity.plan, cached.plan)
-			if identity.user == "" && !planChanged {
+			if identity.user == "" && !planChanged && !clearedMember {
 				identity.user = cached.user
 			}
 			if identity.plan == "" {
 				identity.plan = cached.plan
 			}
 		}
-		element.Value = codexDeviceCacheEntry{key: strings.Clone(key), identity: identity.clone()}
-		r.recent.MoveToFront(element)
+		r.storeIdentityLocked(element, key, version, generation, identity)
 		return identity
 	}
-	if identity.account == "" {
+	if identity.account == "" && version == 0 && generation == 0 {
 		return identity
+	}
+	cachedIdentity := identity
+	if clearedAccount {
+		cachedIdentity = codexDeviceAccount{}
+	}
+	r.storeIdentityLocked(nil, key, version, generation, cachedIdentity)
+	return identity
+}
+
+func (r *CodexDeviceResolver) storeIdentityLocked(element *list.Element, key codexDeviceCacheKey, version, generation uint64, identity codexDeviceAccount) {
+	if identity.account == "" && version == 0 && generation == 0 {
+		if element != nil {
+			delete(r.entries, key)
+			r.recent.Remove(element)
+		}
+		return
+	}
+	key.id = strings.Clone(key.id)
+	entry := codexDeviceCacheEntry{key: key, identity: identity.clone(), credentialVersion: version, generation: generation}
+	if element != nil {
+		element.Value = entry
+		r.recent.MoveToFront(element)
+		return
 	}
 	if len(r.entries) >= codexDeviceCacheLimit {
 		oldest := r.recent.Back()
-		delete(r.entries, oldest.Value.(codexDeviceCacheEntry).key)
+		oldKey := oldest.Value.(codexDeviceCacheEntry).key
+		bit := codexDeviceEvictionBit(oldKey)
+		r.evicted[bit/64] |= 1 << (bit % 64)
+		delete(r.entries, oldKey)
 		r.recent.Remove(oldest)
 	}
-	key = strings.Clone(key)
-	r.entries[key] = r.recent.PushFront(codexDeviceCacheEntry{key: key, identity: identity.clone()})
-	return identity
+	r.entries[key] = r.recent.PushFront(entry)
+}
+
+func codexDeviceEvictionBit(key codexDeviceCacheKey) uint16 {
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%d\x00%s", key.registrationEpoch, key.id)))
+	return uint16(sum[0])<<8 | uint16(sum[1])
+}
+
+func (r *CodexDeviceResolver) wasEvicted(key codexDeviceCacheKey) bool {
+	bit := codexDeviceEvictionBit(key)
+	return r.evicted[bit/64]&(1<<(bit%64)) != 0
 }
 
 func codexDeviceResponsesURL(rawURL string) bool {
@@ -539,6 +687,8 @@ type CodexDeviceIdentity struct {
 	single            string
 	conflicting       bool
 	credentialSubject [32]byte
+	handshakeAuth     [32]byte
+	hasHandshakeAuth  bool
 }
 
 // EffectiveID reports a single UUID device actually represented by final values.
@@ -647,6 +797,9 @@ func (i CodexDeviceIdentity) Compatible(other CodexDeviceIdentity) bool {
 	if i.Enabled && i.credentialSubject != other.credentialSubject {
 		return false
 	}
+	if i.Enabled && i.hasHandshakeAuth && other.hasHandshakeAuth && i.handshakeAuth != other.handshakeAuth {
+		return false
+	}
 	if !i.conflicting && !other.conflicting && i.single != "" && other.single != "" && i.single != other.single {
 		return false
 	}
@@ -692,6 +845,9 @@ func (i CodexDeviceIdentity) Compatible(other CodexDeviceIdentity) bool {
 // Merge remembers values first observed on a reused physical connection. Call
 // only after Compatible; absent fields never erase an established identity.
 func (i CodexDeviceIdentity) Merge(other CodexDeviceIdentity) CodexDeviceIdentity {
+	if !i.hasHandshakeAuth && other.hasHandshakeAuth {
+		i.handshakeAuth, i.hasHandshakeAuth = other.handshakeAuth, true
+	}
 	for field, value := range other.values {
 		if i.values[field] == "" {
 			i.values[field] = value

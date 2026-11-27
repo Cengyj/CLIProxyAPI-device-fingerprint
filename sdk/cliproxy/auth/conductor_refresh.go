@@ -675,6 +675,11 @@ func applyPreservedRenewalState(existing, updated *Auth, mode updateAuthMode, no
 		currentSIWCRT := authSIWCTokenField(updated, "refresh_token")
 		outerStillMatchesFailed := failedOuterRT == "" || (currentOuterRT == failedOuterRT && (existing == nil || authRefreshToken(existing) == failedOuterRT))
 		siwcStillMatchesFailed := failedSIWCRT == "" || (currentSIWCRT == failedSIWCRT && (existing == nil || authSIWCTokenField(existing, "refresh_token") == failedSIWCRT))
+		if !siwcStillMatchesFailed && currentSIWCRT == failedSIWCRT && existing != nil && updated.CodexRefreshPatch != nil {
+			// Home may rotate the grant before this same refresh attempts its
+			// local renewal. Bind that failure to the adopted partition version.
+			siwcStillMatchesFailed = updated.CodexRefreshPatch.CanApplySIWCTo(existing.Metadata)
+		}
 		outerTerminal := outerErr != nil && outerStillMatchesFailed && isTerminalRefreshError(updated, outerErr)
 		siwcTerminal := siwcErr != nil && siwcStillMatchesFailed && isTerminalRefreshError(updated, siwcErr)
 		preservedRejectedOuter := existing != nil && existing.RejectedRefreshToken != "" && currentOuterRT == existing.RejectedRefreshToken
@@ -849,6 +854,9 @@ func authSIWCTokenField(auth *Auth, key string) string {
 	siwcMap, ok := auth.Metadata["siwc"].(map[string]any)
 	if !ok || len(siwcMap) == 0 {
 		return ""
+	}
+	if key == "access_token" {
+		return codex.SIWCAccessToken(siwcMap)
 	}
 	val, _ := siwcMap[key].(string)
 	return strings.TrimSpace(val)

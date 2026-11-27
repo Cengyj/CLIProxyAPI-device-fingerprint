@@ -1,5 +1,7 @@
 package codex
 
+import "strings"
+
 // PKCECodes holds the verification codes for the OAuth2 PKCE (Proof Key for Code Exchange) flow.
 // PKCE is an extension to the Authorization Code flow to prevent CSRF and authorization code injection attacks.
 type PKCECodes struct {
@@ -44,6 +46,24 @@ type CodexSIWCTokenData struct {
 	EarliestRefreshAt any      `json:"earliest_refresh_at,omitempty"`
 	LastRefresh       string   `json:"last_refresh"`
 	DeviceID          string   `json:"device_id,omitempty"`
+}
+
+// SIWCAccessToken reads the canonical token or its historical access alias.
+func SIWCAccessToken(siwc map[string]any) string {
+	for _, key := range []string{"access_token", "access"} {
+		if token, ok := siwc[key].(string); ok && strings.TrimSpace(token) != "" {
+			return strings.TrimSpace(token)
+		}
+	}
+	return ""
+}
+
+// NormalizeSIWCAccessToken canonicalizes an owned SIWC credential snapshot in place.
+func NormalizeSIWCAccessToken(siwc map[string]any) {
+	if token := SIWCAccessToken(siwc); token != "" {
+		siwc["access_token"] = token
+	}
+	delete(siwc, "access")
 }
 
 // ToMap converts CodexSIWCTokenData into a map suitable for credential metadata persistence.

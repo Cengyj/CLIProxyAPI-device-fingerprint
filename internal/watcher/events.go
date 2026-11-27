@@ -32,8 +32,19 @@ func (w *Watcher) start(ctx context.Context) error {
 		return errAddConfig
 	}
 	log.Debugf("watching config file: %s", w.configPath)
+	// Atomic saves replace the watched inode. Keep the parent directory watched
+	// as well so later replacements and writes still reach the config path filter.
+	configDir := filepath.Dir(w.configPath)
+	if errAddConfigDir := w.watcher.Add(configDir); errAddConfigDir != nil {
+		log.Errorf("failed to watch config directory %s: %v", configDir, errAddConfigDir)
+		return errAddConfigDir
+	}
 
 	w.watchMu.Lock()
+	if errTarget := w.syncConfigTargetWatchLocked(); errTarget != nil {
+		w.watchMu.Unlock()
+		return errTarget
+	}
 	authDir := w.currentAuthDir()
 	if errAddAuthDir := w.watcher.Add(authDir); errAddAuthDir != nil {
 		w.watchMu.Unlock()
@@ -45,9 +56,23 @@ func (w *Watcher) start(ctx context.Context) error {
 	w.watchMu.Unlock()
 	log.Debugf("watching auth directory: %s", authDir)
 
+	// The HTTP server may already accept requests before this watcher starts.
+	// Reconcile a file-backed startup snapshot after subscribing, so an edit
+	// between the initial load and subscription does not require another save.
+	// Programmatic configurations have no source hash and retain their snapshot.
+	w.configApplyMu.Lock()
+	w.clientsMutex.Lock()
+	if w.config != nil {
+		w.lastConfigHash = w.config.SourceHash
+	}
+	reconcileSource := w.lastConfigHash != ""
+	w.clientsMutex.Unlock()
 	go w.processEvents(ctx)
-
 	w.reloadClients(true, nil, false)
+	w.configApplyMu.Unlock()
+	if reconcileSource {
+		w.reloadConfigIfChanged()
+	}
 	return nil
 }
 
@@ -65,7 +90,9 @@ func (w *Watcher) syncAuthDirWatch() {
 	if oldWatched == target {
 		return
 	}
-	if oldWatched != "" && !w.sameNormalizedAuthPath(oldWatched, w.configPath) && !w.sameNormalizedAuthPath(oldWatched, target) {
+	if oldWatched != "" && !w.sameNormalizedAuthPath(oldWatched, w.configPath) &&
+		!w.sameNormalizedAuthPath(oldWatched, filepath.Dir(w.configPath)) &&
+		!w.sameNormalizedAuthPath(oldWatched, filepath.Dir(w.watchedConfigTarget)) && !w.sameNormalizedAuthPath(oldWatched, target) {
 		if errRemove := w.watcher.Remove(oldWatched); errRemove != nil {
 			log.Debugf("failed to remove previous auth directory watch %s: %v", oldWatched, errRemove)
 		}
@@ -85,6 +112,50 @@ func (w *Watcher) syncAuthDirWatch() {
 	}
 	w.watchedAuthDir = target
 	log.Debugf("watching auth directory: %s", target)
+}
+
+// syncConfigTargetWatchLocked follows a config symlink without accumulating old
+// target-directory watches. The configured path's parent stays watched so a
+// subsequent symlink replacement can select another target.
+func (w *Watcher) syncConfigTargetWatchLocked() error {
+	target, errResolve := filepath.EvalSymlinks(w.configPath)
+	if errResolve != nil {
+		return errResolve
+	}
+	if w.sameNormalizedAuthPath(target, w.watchedConfigTarget) {
+		return nil
+	}
+	targetDir := filepath.Dir(target)
+	if errAdd := w.watcher.Add(targetDir); errAdd != nil {
+		return errAdd
+	}
+	previous := w.watchedConfigTarget
+	w.watchedConfigTarget = target
+	if previous != "" {
+		oldDir := filepath.Dir(previous)
+		if !w.sameNormalizedAuthPath(oldDir, targetDir) &&
+			!w.sameNormalizedAuthPath(oldDir, filepath.Dir(w.configPath)) &&
+			!w.sameNormalizedAuthPath(oldDir, w.watchedAuthDir) {
+			if errRemove := w.watcher.Remove(oldDir); errRemove != nil {
+				log.Debugf("failed to remove previous config target directory watch %s: %v", oldDir, errRemove)
+			}
+		}
+	}
+	return nil
+}
+
+func (w *Watcher) syncConfigTargetWatch() {
+	if w == nil || w.watcher == nil || w.stopped.Load() {
+		return
+	}
+	w.watchMu.Lock()
+	defer w.watchMu.Unlock()
+	if !w.started || w.stopped.Load() {
+		return
+	}
+	if errSync := w.syncConfigTargetWatchLocked(); errSync != nil {
+		log.Debugf("failed to watch config target directory: %v", errSync)
+	}
 }
 
 func (w *Watcher) processEvents(ctx context.Context) {
@@ -112,7 +183,19 @@ func (w *Watcher) handleEvent(event fsnotify.Event) {
 	normalizedName := w.normalizeAuthPath(event.Name)
 	normalizedConfigPath := w.normalizeAuthPath(w.configPath)
 	normalizedAuthDir := w.normalizeAuthPath(w.currentAuthDir())
-	isConfigEvent := normalizedName == normalizedConfigPath && event.Op&configOps != 0
+	w.watchMu.Lock()
+	configTarget := w.watchedConfigTarget
+	w.watchMu.Unlock()
+	isConfigEvent := (normalizedName == normalizedConfigPath || w.sameNormalizedAuthPath(normalizedName, configTarget)) && event.Op&configOps != 0
+	if !isConfigEvent && configTarget != "" && !w.sameNormalizedAuthPath(w.configPath, configTarget) &&
+		event.Op&(fsnotify.Create|fsnotify.Rename|fsnotify.Remove) != 0 &&
+		(w.sameNormalizedAuthPath(filepath.Dir(event.Name), filepath.Dir(w.configPath)) || w.sameNormalizedAuthPath(filepath.Dir(event.Name), filepath.Dir(configTarget))) {
+		// Projected volumes replace an intermediate directory symlink such as
+		// ..data, leaving the configured file symlink itself untouched. Some
+		// backends report the staging link before the replacement is visible;
+		// resolve after debouncing. Unrelated mutations stop at the hash check.
+		isConfigEvent = true
+	}
 	authOps := fsnotify.Create | fsnotify.Write | fsnotify.Remove | fsnotify.Rename
 	isAuthJSON := filepath.Dir(normalizedName) == normalizedAuthDir && strings.HasSuffix(normalizedName, ".json") && event.Op&authOps != 0
 	if !isConfigEvent && !isAuthJSON {

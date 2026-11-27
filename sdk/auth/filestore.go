@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/MoeForge/moego/json"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/codex"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
@@ -216,10 +217,19 @@ func (s *FileTokenStore) Delete(ctx context.Context, id string) error {
 	if err != nil {
 		return err
 	}
-	if err = os.Remove(path); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("auth filestore: delete failed: %w", err)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, errStat := os.Stat(path); os.IsNotExist(errStat) {
+		return nil
 	}
-	return nil
+	// Match Save's lock order. The file lock also excludes Codex executor
+	// refreshes and saves made through another FileTokenStore instance.
+	return codex.WithFileLock(path, func() error {
+		if errRemove := os.Remove(path); errRemove != nil && !os.IsNotExist(errRemove) {
+			return fmt.Errorf("auth filestore: delete failed: %w", errRemove)
+		}
+		return nil
+	})
 }
 
 func (s *FileTokenStore) resolveDeletePath(id string) (string, error) {

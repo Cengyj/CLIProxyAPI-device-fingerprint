@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/MoeForge/moego/json"
 	codexauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth/codex"
@@ -23,6 +24,9 @@ type homeStatusErr struct {
 	errorType  string
 	upstream   bool
 }
+
+// ErrHomeRefreshRecordMismatch rejects the entire response before either partition is adopted.
+var ErrHomeRefreshRecordMismatch error = homeStatusErr{code: http.StatusBadGateway, msg: "home refresh returned a different credential record or provider"}
 
 func (e homeStatusErr) Error() string {
 	if e.upstream {
@@ -63,8 +67,8 @@ type homeErrorEnvelope struct {
 }
 
 type homeRefreshAuthEnvelope struct {
-	Auth      cliproxyauth.Auth `json:"auth"`
-	AuthIndex string            `json:"auth_index"`
+	Auth      json.RawMessage `json:"auth"`
+	AuthIndex string          `json:"auth_index"`
 }
 
 type homeErrorDetail struct {
@@ -89,6 +93,86 @@ var currentHomeRefreshClient = func() homeRefreshClient {
 	return home.Current()
 }
 
+// CodexHomeRefreshIdentity selects the identity to persist with a Home renewal.
+// A matching bearer permits sparse updates until an explicit subject hint changes.
+func CodexHomeRefreshIdentity(current, returned *cliproxyauth.Auth) *cliproxyauth.Auth {
+	if current == nil || returned == nil {
+		return returned
+	}
+	currentAccess, _ := current.Metadata["access_token"].(string)
+	nextAccess, _ := returned.Metadata["access_token"].(string)
+	if strings.TrimSpace(currentAccess) == "" || strings.TrimSpace(currentAccess) != strings.TrimSpace(nextAccess) {
+		return returned
+	}
+	identity := current.Clone()
+	AdoptCodexHomeIdentity(identity, current)
+	for _, key := range []string{"account_id", "id_token", "chatgpt_user_id"} {
+		if value, present := returned.Metadata[key]; present {
+			text, valid := value.(string)
+			if !valid || strings.TrimSpace(text) == "" || strings.TrimSpace(text) != identity.Metadata[key] {
+				return returned
+			}
+		} else if value, present := returned.Attributes[key]; present {
+			if strings.TrimSpace(value) == "" || strings.TrimSpace(value) != identity.Metadata[key] {
+				return returned
+			}
+		}
+	}
+	// Plans can change without replacing the account or member. Treat each
+	// explicitly supplied plan source as authoritative over inherited aliases.
+	planChanged := false
+	for _, key := range []string{"plan_type", "chatgpt_plan_type"} {
+		if _, present := returned.Metadata[key]; present {
+			planChanged = true
+		} else if _, present := returned.Attributes[key]; present {
+			planChanged = true
+		}
+	}
+	if planChanged {
+		for _, key := range []string{"plan_type", "chatgpt_plan_type", "plan_type_defaulted"} {
+			delete(identity.Metadata, key)
+			delete(identity.Attributes, key)
+		}
+	}
+	_, canonicalPlan := returned.Metadata["plan_type"]
+	_, canonicalClaimPlan := returned.Metadata["chatgpt_plan_type"]
+	for _, key := range []string{"plan_type", "chatgpt_plan_type", "plan_type_defaulted"} {
+		if value, present := returned.Metadata[key]; present {
+			identity.Metadata[key] = value
+		} else if value, present := returned.Attributes[key]; present {
+			if canonicalPlan || canonicalClaimPlan {
+				continue
+			}
+			if key == "plan_type_defaulted" {
+				flag, _ := strconv.ParseBool(strings.TrimSpace(value))
+				identity.Metadata[key] = flag
+			} else {
+				identity.Metadata[key] = value
+			}
+		}
+	}
+	if planChanged {
+		planValue, hasPlan := identity.Metadata["plan_type"]
+		if !hasPlan {
+			planValue = identity.Metadata["chatgpt_plan_type"]
+		}
+		plan, _ := planValue.(string)
+		if strings.TrimSpace(plan) == "" {
+			// The retained ID token describes the preceding snapshot. Keep an
+			// explicit clearing marker so its old plan cannot reappear on reload.
+			identity.Metadata["plan_type"] = codexauth.DefaultPlanType
+			identity.Metadata["plan_type_defaulted"] = true
+			identity.Metadata["chatgpt_plan_type"] = ""
+		} else if hasPlan {
+			defaulted, _ := identity.Metadata["plan_type_defaulted"].(bool)
+			if _, hasAlias := identity.Metadata["chatgpt_plan_type"]; !hasAlias && !defaulted {
+				identity.Metadata["chatgpt_plan_type"] = ""
+			}
+		}
+	}
+	return identity
+}
+
 // AdoptCodexHomeIdentity replaces identity hints with the adopted Home credential.
 func AdoptCodexHomeIdentity(target, source *cliproxyauth.Auth) {
 	if target == nil || source == nil {
@@ -102,6 +186,12 @@ func AdoptCodexHomeIdentity(target, source *cliproxyauth.Auth) {
 	token, tokenPresent := metadataString("id_token")
 	claims, _ := codexauth.ParseJWTToken(token)
 	account, accountPresent := metadataString("account_id")
+	if accountPresent && account == "" {
+		// An explicit canonical clear outranks a repeated token snapshot. The
+		// token must also be cleared so later readers cannot restore its account.
+		token = ""
+		claims = nil
+	}
 	if !accountPresent {
 		// A canonical token can supply an omitted canonical account before
 		// consulting an auxiliary snapshot of the previous credential.
@@ -204,6 +294,7 @@ func AdoptCodexHomeIdentity(target, source *cliproxyauth.Auth) {
 			plan = codexauth.DefaultPlanType
 		}
 	}
+	clearedPlan := claimPlanPresent && claimPlan == "" && planPresent && defaulted
 
 	metadata := make(map[string]any, len(target.Metadata)+6)
 	for key, value := range target.Metadata {
@@ -214,10 +305,12 @@ func AdoptCodexHomeIdentity(target, source *cliproxyauth.Auth) {
 	metadata["id_token"] = token
 	delete(metadata, "chatgpt_user_id")
 	delete(metadata, "chatgpt_plan_type")
-	if member != "" {
+	if _, memberPresent := source.Metadata["chatgpt_user_id"]; member != "" || memberPresent {
+		// Retain a canonical clearing marker so a repeated ID token, auxiliary
+		// attribute or warm resolver cannot restore an explicitly removed member.
 		metadata["chatgpt_user_id"] = member
 	}
-	if claimPlan != "" {
+	if claimPlan != "" || clearedPlan {
 		metadata["chatgpt_plan_type"] = claimPlan
 	}
 	metadata["plan_type"] = plan
@@ -236,10 +329,90 @@ func AdoptCodexHomeIdentity(target, source *cliproxyauth.Auth) {
 	target.Attributes = attributes
 }
 
+// HomeRenewedSIWC distinguishes a completed SIWC renewal from a Home response
+// that echoes the current grant while refreshing the outer OAuth partition.
+func HomeRenewedSIWC(current, result *cliproxyauth.Auth, now time.Time) bool {
+	previous, _ := current.Metadata["siwc"].(map[string]any)
+	returned, _ := result.Metadata["siwc"].(map[string]any)
+	token := codexauth.SIWCAccessToken(returned)
+	if token == "" || token == current.RejectedSIWCAccessToken || token == current.RejectedAccessToken {
+		return false
+	}
+	newExpiry, hasExpiry := result.SIWCRenewalExpirationTime()
+	if token != codexauth.SIWCAccessToken(previous) {
+		// Changed bytes can still describe an expired credential. Preserve
+		// unknown-lifetime compatibility, but honor any known renewal window.
+		return !hasExpiry || newExpiry.After(now.Add(cliproxyauth.CodexSIWCRefreshLead))
+	}
+	oldExpiry, _ := current.SIWCRenewalExpirationTime()
+	return hasExpiry && newExpiry.After(oldExpiry) && newExpiry.After(now.Add(cliproxyauth.CodexSIWCRefreshLead))
+}
+
+// AdoptCodexHomeSIWC completes a sparse renewal without reviving an identity
+// or expiration belonging to a replaced bearer. Registration and an omitted
+// refresh token remain usable until Home explicitly replaces or clears them.
+func AdoptCodexHomeSIWC(current, returned map[string]any) map[string]any {
+	adopted := make(map[string]any, len(current)+len(returned))
+	for key, value := range current {
+		adopted[key] = value
+	}
+	sameBearer := codexauth.SIWCAccessToken(current) == codexauth.SIWCAccessToken(returned)
+	delete(adopted, "access_token")
+	delete(adopted, "access")
+	if !sameBearer {
+		for _, key := range []string{"id_token", "earliest_refresh_at", "last_refresh", "lastRefresh"} {
+			delete(adopted, key)
+		}
+	}
+	for key, value := range returned {
+		adopted[key] = value
+	}
+	cliproxyauth.ReplaceCodexSIWCExpiration(adopted, current, returned, sameBearer)
+	codexauth.NormalizeSIWCAccessToken(adopted)
+	return adopted
+}
+
 // RefreshAuthViaHome replaces local refresh logic when home control plane integration is enabled.
 // It returns (updatedAuth, true, nil) when home refresh succeeds; (nil, true, err) when home is
 // enabled but refresh fails; and (nil, false, nil) when home is disabled.
 func RefreshAuthViaHome(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth) (*cliproxyauth.Auth, bool, error) {
+	return refreshAuthViaHome(ctx, cfg, auth, nil)
+}
+
+// RefreshCodexAuthViaHome checks the record selected for the file lock before
+// interpreting its state or either OAuth partition.
+func RefreshCodexAuthViaHome(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth) (*cliproxyauth.Auth, bool, error) {
+	return refreshAuthViaHome(ctx, cfg, auth, func(updated *cliproxyauth.Auth) error {
+		if updated.ID != "" && updated.ID != auth.ID {
+			return ErrHomeRefreshRecordMismatch
+		}
+		if updated.Provider != "" && !strings.EqualFold(strings.TrimSpace(updated.Provider), "codex") {
+			return ErrHomeRefreshRecordMismatch
+		}
+		// The watcher reads the persisted file type as its provider on restart.
+		if rawType, exists := updated.Metadata["type"]; exists {
+			fileType, _ := rawType.(string)
+			if !strings.EqualFold(strings.TrimSpace(fileType), "codex") {
+				return ErrHomeRefreshRecordMismatch
+			}
+		}
+		// Home owns credential contents, not this process's storage location.
+		// A remote path could redirect a later save or its read-before-write
+		// adoption to another record even when the returned ID matches.
+		for _, key := range []string{cliproxyauth.AttributePath, cliproxyauth.AttributeSource, cliproxyauth.AttributeSourceBackend, cliproxyauth.AttributeRuntimeOnly} {
+			delete(updated.Attributes, key)
+			if value, present := auth.Attributes[key]; present {
+				if updated.Attributes == nil {
+					updated.Attributes = make(map[string]string)
+				}
+				updated.Attributes[key] = value
+			}
+		}
+		return nil
+	})
+}
+
+func refreshAuthViaHome(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, validate func(*cliproxyauth.Auth) error) (*cliproxyauth.Auth, bool, error) {
 	if cfg == nil || !cfg.Home.Enabled {
 		return nil, false, nil
 	}
@@ -309,6 +482,11 @@ func RefreshAuthViaHome(ctx context.Context, cfg *config.Config, auth *cliproxya
 			diagnostic: "Home refresh response decode failed: " + logging.SafeErrorDiagnostic(errParse),
 		}
 	}
+	if validate != nil {
+		if errValidate := validate(updated); errValidate != nil {
+			return nil, true, errValidate
+		}
+	}
 	if updated.Disabled || updated.Status == cliproxyauth.StatusDisabled {
 		return nil, true, homeStatusErr{code: http.StatusUnauthorized, msg: "credential unauthorized"}
 	}
@@ -325,32 +503,26 @@ func authAccessTokenSHA256(auth *cliproxyauth.Auth) string {
 }
 
 func parseHomeRefreshAuth(raw []byte) (*cliproxyauth.Auth, string, error) {
-	var rawObject map[string]json.RawMessage
-	if errUnmarshal := json.Unmarshal(raw, &rawObject); errUnmarshal != nil {
+	var envelope homeRefreshAuthEnvelope
+	if errUnmarshal := json.Unmarshal(raw, &envelope); errUnmarshal != nil {
 		return nil, "", errUnmarshal
 	}
-	if len(rawObject) == 0 {
-		return nil, "", errors.New("empty auth object")
-	}
-	if authRaw, ok := rawObject["auth"]; ok {
-		var authObject map[string]json.RawMessage
-		if errUnmarshal := json.Unmarshal(authRaw, &authObject); errUnmarshal != nil {
-			return nil, "", errUnmarshal
-		}
-		if len(authObject) == 0 {
-			return nil, "", errors.New("empty auth envelope")
-		}
-		var envelope homeRefreshAuthEnvelope
-		if errUnmarshal := json.Unmarshal(raw, &envelope); errUnmarshal != nil {
-			return nil, "", errUnmarshal
-		}
-		return &envelope.Auth, strings.TrimSpace(envelope.AuthIndex), nil
+	index := ""
+	if envelope.Auth != nil {
+		raw = envelope.Auth
+		index = strings.TrimSpace(envelope.AuthIndex)
 	}
 	var updated cliproxyauth.Auth
 	if errUnmarshal := json.Unmarshal(raw, &updated); errUnmarshal != nil {
 		return nil, "", errUnmarshal
 	}
-	return &updated, "", nil
+	// Metadata and attributes are provider-defined, including plugin credentials.
+	// A disabled record is meaningful even without any credential or identifier.
+	if strings.TrimSpace(updated.ID) == "" && strings.TrimSpace(updated.Provider) == "" &&
+		len(updated.Metadata) == 0 && len(updated.Attributes) == 0 && !updated.Disabled && updated.Status != cliproxyauth.StatusDisabled {
+		return nil, "", errors.New("missing auth record in refresh response")
+	}
+	return &updated, index, nil
 }
 
 func statusFromHomeErrorCode(code string) int {

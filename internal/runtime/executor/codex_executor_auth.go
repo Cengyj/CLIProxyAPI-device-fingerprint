@@ -2,10 +2,12 @@ package executor
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -75,16 +77,8 @@ func codexSIWCAccessToken(auth *cliproxyauth.Auth) string {
 	if auth == nil || auth.Metadata == nil {
 		return ""
 	}
-	siwcMap, ok := auth.Metadata["siwc"].(map[string]any)
-	if !ok || len(siwcMap) == 0 {
-		return ""
-	}
-	for _, key := range []string{"access_token", "access"} {
-		if tok, okTok := siwcMap[key].(string); okTok && strings.TrimSpace(tok) != "" {
-			return strings.TrimSpace(tok)
-		}
-	}
-	return ""
+	siwcMap, _ := auth.Metadata["siwc"].(map[string]any)
+	return codexauth.SIWCAccessToken(siwcMap)
 }
 
 func cloneSIWCMap(src map[string]any) map[string]any {
@@ -114,8 +108,10 @@ func resolveCodexAuthDiskPath(cfg *config.Config, auth *cliproxyauth.Auth) (stri
 		return "", nil
 	}
 	var candidates []string
+	explicitPath := ""
 	if len(auth.Attributes) > 0 {
 		if p := strings.TrimSpace(auth.Attributes[cliproxyauth.AttributePath]); p != "" {
+			explicitPath = p
 			candidates = append(candidates, p)
 		}
 		if s := strings.TrimSpace(auth.Attributes[cliproxyauth.AttributeSource]); s != "" && !strings.Contains(s, ":") {
@@ -136,6 +132,11 @@ func resolveCodexAuthDiskPath(cfg *config.Config, auth *cliproxyauth.Auth) (stri
 		info, errStat := os.Stat(candidate)
 		if errStat != nil {
 			if os.IsNotExist(errStat) {
+				// An established source may have been deleted before its watcher
+				// event reaches Manager. Do not turn it into a memory-only refresh.
+				if candidate == explicitPath {
+					return "", fmt.Errorf("codex executor: credential source removed: %w", errStat)
+				}
 				continue
 			}
 			return "", fmt.Errorf("codex executor: stat credential file %s: %w", candidate, errStat)
@@ -159,7 +160,7 @@ func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*
 	}
 	homeEnabled := cfg != nil && cfg.Home.Enabled
 	if auth == nil {
-		if refreshed, handled, err := helps.RefreshAuthViaHome(ctx, cfg, auth); handled {
+		if refreshed, handled, err := helps.RefreshCodexAuthViaHome(ctx, cfg, auth); handled {
 			return refreshed, err
 		}
 		return nil, statusErr{code: 500, msg: "codex executor: auth is nil"}
@@ -181,12 +182,24 @@ func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*
 	return e.refreshLocked(ctx, auth, "", homeEnabled)
 }
 
-func (e *CodexExecutor) refreshLocked(ctx context.Context, auth *cliproxyauth.Auth, diskPath string, homeEnabled bool) (*cliproxyauth.Auth, error) {
+func (e *CodexExecutor) refreshLocked(ctx context.Context, auth *cliproxyauth.Auth, diskPath string, homeEnabled bool) (refreshed *cliproxyauth.Auth, err error) {
+	defer func() {
+		if refreshed == nil || refreshed.CodexRefreshPatch == nil {
+			return
+		}
+		refreshed.CodexRefreshPatch = refreshed.CodexRefreshPatch.WithSourceFile(diskPath)
+		if storage, ok := refreshed.Storage.(*codexauth.CodexTokenStorage); ok && storage != nil {
+			snapshot := storage.WithMetadataSnapshot(refreshed.Metadata)
+			snapshot.RefreshPatch = refreshed.CodexRefreshPatch
+			refreshed.Storage = snapshot
+		}
+	}()
 	var cfg *config.Config
 	if e != nil {
 		cfg = e.cfg
 	}
-	beforeRefresh := auth.Clone()
+	beforeRefresh := auth
+	auth = auth.Clone()
 	auth.CodexRefreshPatch = nil
 	if auth.Metadata == nil {
 		auth.Metadata = make(map[string]any)
@@ -213,21 +226,19 @@ func (e *CodexExecutor) refreshLocked(ctx context.Context, auth *cliproxyauth.Au
 		if siwcSub, okSub := diskMap["siwc"].(map[string]any); okSub {
 			diskBaseline["siwc"] = cloneSIWCMap(siwcSub)
 		}
-		inOuterRef, _ := auth.Metadata["refresh_token"].(string)
-		inOuterAcc, _ := auth.Metadata["access_token"].(string)
-		diskOuterRef, _ := diskMap["refresh_token"].(string)
-		diskOuterAcc, _ := diskMap["access_token"].(string)
-		if (strings.TrimSpace(diskOuterRef) != "" && strings.TrimSpace(diskOuterRef) != strings.TrimSpace(inOuterRef)) ||
-			(strings.TrimSpace(diskOuterAcc) != "" && strings.TrimSpace(diskOuterAcc) != strings.TrimSpace(inOuterAcc)) {
+		if !codexauth.SameOuterCredentialSnapshot(auth.Metadata, diskMap) {
 			diskRotatedOuter = true
-			for _, key := range []string{"id_token", "access_token", "refresh_token", "account_id", "last_refresh", "email", "expired", "plan_type", "plan_type_defaulted", "chatgpt_user_id", "chatgpt_plan_type", "type"} {
+			cliproxyauth.ReplaceCodexOuterExpiration(auth.Metadata, diskMap, false)
+			cliproxyauth.ReplaceCodexOuterRefreshTime(auth, &cliproxyauth.Auth{Metadata: diskMap}, false)
+			for _, key := range []string{"id_token", "access_token", "refresh_token", "account_id", "last_refresh", "email", "plan_type", "plan_type_defaulted", "chatgpt_user_id", "chatgpt_plan_type", "type"} {
 				if val, exists := diskMap[key]; exists {
 					auth.Metadata[key] = val
 				} else {
 					switch key {
-					case "account_id", "id_token":
+					case "account_id", "id_token", "access_token", "refresh_token", "email":
 						// Keep versioned fields in the refresh patch so Manager's
-						// generic deletion pass cannot invalidate its baseline.
+						// generic deletion pass cannot invalidate its baseline. A full
+						// disk replacement must not inherit the previous grant.
 						auth.Metadata[key] = ""
 					case "plan_type", "plan_type_defaulted", "chatgpt_user_id", "chatgpt_plan_type":
 						delete(auth.Metadata, key)
@@ -252,15 +263,23 @@ func (e *CodexExecutor) refreshLocked(ctx context.Context, auth *cliproxyauth.Au
 		}
 		diskSIWC, _ := diskMap["siwc"].(map[string]any)
 		inSIWC, _ := auth.Metadata["siwc"].(map[string]any)
-		if len(diskSIWC) > 0 {
-			inSIWCRef, _ := inSIWC["refresh_token"].(string)
-			inSIWCAcc, _ := inSIWC["access_token"].(string)
-			diskSIWCRef, _ := diskSIWC["refresh_token"].(string)
-			diskSIWCAcc, _ := diskSIWC["access_token"].(string)
-			if (strings.TrimSpace(diskSIWCRef) != "" && strings.TrimSpace(diskSIWCRef) != strings.TrimSpace(inSIWCRef)) ||
-				(strings.TrimSpace(diskSIWCAcc) != "" && strings.TrimSpace(diskSIWCAcc) != strings.TrimSpace(inSIWCAcc)) {
+		if !codexauth.SameSIWCCredentialSnapshot(inSIWC, diskSIWC) {
+			if len(diskSIWC) > 0 {
 				diskRotatedSIWC = true
-				auth.Metadata["siwc"] = cloneSIWCMap(diskSIWC)
+				codexauth.NormalizeSIWCAccessToken(diskSIWC)
+				// This is a complete disk snapshot, not a sparse Home response.
+				// Carry removed grant and registration fields through the versioned
+				// patch instead of inheriting them from the previous credential.
+				for _, key := range []string{"access_token", "refresh_token", "id_token", "client_id", "device_id", "scope", "scopes"} {
+					if _, present := diskSIWC[key]; !present {
+						diskSIWC[key] = ""
+					}
+				}
+				auth.Metadata["siwc"] = diskSIWC
+			} else {
+				// Absent, null and empty disk partitions cannot supply an old grant.
+				diskRotatedSIWC = true
+				delete(auth.Metadata, "siwc")
 			}
 		}
 		if diskUse, hasDiskUse := diskMap["use_siwc"]; hasDiskUse {
@@ -326,14 +345,14 @@ func (e *CodexExecutor) refreshLocked(ctx context.Context, auth *cliproxyauth.Au
 		needSIWC = false
 	}
 	suppressedRejectedOuter := false
-	if !diskRotatedOuter && auth.RejectedRefreshToken != "" && outerRefreshToken == strings.TrimSpace(auth.RejectedRefreshToken) {
+	if auth.RejectedRefreshToken != "" && outerRefreshToken == strings.TrimSpace(auth.RejectedRefreshToken) {
 		if needOuter {
 			suppressedRejectedOuter = true
 		}
 		needOuter = false
 	}
 	suppressedRejectedSIWC := false
-	if !diskRotatedSIWC && auth.RejectedSIWCRefreshToken != "" && siwcRefreshToken == strings.TrimSpace(auth.RejectedSIWCRefreshToken) {
+	if auth.RejectedSIWCRefreshToken != "" && siwcRefreshToken == strings.TrimSpace(auth.RejectedSIWCRefreshToken) {
 		if needSIWC {
 			suppressedRejectedSIWC = true
 		}
@@ -345,11 +364,6 @@ func (e *CodexExecutor) refreshLocked(ctx context.Context, auth *cliproxyauth.Au
 			patch := codexauth.NewCredentialRefreshPatchWithDiskBaseline(beforeRefresh.Metadata, diskBaseline, auth.Metadata, diskRotatedOuter, diskRotatedSIWC)
 			patch.SetUpstreamRefreshed(false)
 			auth.CodexRefreshPatch = patch
-			if storage, ok := auth.Storage.(*codexauth.CodexTokenStorage); ok && storage != nil {
-				clonedStorage := *storage
-				clonedStorage.RefreshPatch = patch
-				auth.Storage = &clonedStorage
-			}
 			return auth, nil
 		}
 		if suppressedRejectedOuter || suppressedRejectedSIWC {
@@ -375,38 +389,58 @@ func (e *CodexExecutor) refreshLocked(ctx context.Context, auth *cliproxyauth.Au
 	outerRefreshed := false
 	var outerErr error
 	siwcRefreshed := false
+	siwcAdopted := false
 	var siwcErr error
 
 	// Execute refreshes sequentially so outer and SIWC never race on the same credential state.
 	if needOuter {
 		if homeEnabled {
-			if refreshed, handled, errHome := helps.RefreshAuthViaHome(ctx, cfg, auth); handled {
+			if refreshed, handled, errHome := helps.RefreshCodexAuthViaHome(ctx, cfg, auth); handled {
+				if errors.Is(errHome, helps.ErrHomeRefreshRecordMismatch) {
+					return nil, errHome
+				}
 				if errHome != nil {
 					outerErr = errHome
 				} else if refreshed != nil {
 					// Home can complete either credential partition independently.
 					// A returned bearer confirms an outer result even if it did not
 					// rotate; identity-only or SIWC-only responses do not replace it.
-					if homeSIWC, okSIWC := refreshed.Metadata["siwc"].(map[string]any); okSIWC && codexSIWCAccessToken(refreshed) != "" {
-						existingSIWC = cloneSIWCMap(homeSIWC)
-						siwcRefreshed = true
-						needSIWC = false
+					if homeSIWC, okSIWC := refreshed.Metadata["siwc"].(map[string]any); okSIWC && codexauth.SIWCAccessToken(homeSIWC) != "" {
+						siwcRefreshed = helps.HomeRenewedSIWC(auth, refreshed, now)
+						adoptedSIWC := helps.AdoptCodexHomeSIWC(existingSIWC, homeSIWC)
+						siwcAdopted = !reflect.DeepEqual(existingSIWC, adoptedSIWC)
+						existingSIWC = adoptedSIWC
+						auth.Metadata["siwc"] = cloneSIWCMap(existingSIWC)
+						// A rotated renewal grant must be saved even when Home did
+						// not renew the bearer. Any remaining renewal uses that grant.
+						siwcRefreshToken, _ = existingSIWC["refresh_token"].(string)
+						siwcClientID, _ = existingSIWC["client_id"].(string)
+						siwcDeviceID, _ = existingSIWC["device_id"].(string)
+						siwcRefreshToken = strings.TrimSpace(siwcRefreshToken)
+						siwcClientID = strings.TrimSpace(siwcClientID)
+						siwcDeviceID = strings.TrimSpace(siwcDeviceID)
+						_, hasSIWC, dueSIWC := cliproxyauth.CodexSIWCNeedsRefresh(auth, now)
+						needSIWC = !siwcRefreshed && hasSIWC && (needSIWC || dueSIWC)
+						if earliest, okEarliest := auth.SIWCEarliestRefreshTime(); okEarliest && now.Before(earliest) {
+							needSIWC = false
+						}
+						if siwcRefreshToken == strings.TrimSpace(auth.RejectedSIWCRefreshToken) {
+							needSIWC = false
+						}
 					}
 					homeAccess, _ := refreshed.Metadata["access_token"].(string)
 					if strings.TrimSpace(homeAccess) == "" {
 						outerErr = statusErr{code: http.StatusBadGateway, msg: "home returned no outer OAuth credential"}
 					} else {
 						outerRefreshed = true
-						if refreshed.ID != "" {
-							auth.ID = refreshed.ID
-						}
-						if refreshed.Provider != "" {
-							auth.Provider = refreshed.Provider
-						}
+						identity := helps.CodexHomeRefreshIdentity(auth, refreshed)
+						oldAccess, _ := auth.Metadata["access_token"].(string)
+						cliproxyauth.ReplaceCodexOuterExpiration(auth.Metadata, refreshed.Metadata, strings.TrimSpace(homeAccess) == strings.TrimSpace(oldAccess))
+						cliproxyauth.ReplaceCodexOuterRefreshTime(auth, refreshed, strings.TrimSpace(homeAccess) == strings.TrimSpace(oldAccess))
 						auth.Index = refreshed.Index
 						if refreshed.Metadata != nil {
 							for k, val := range refreshed.Metadata {
-								if k == "siwc" || k == "use_siwc" {
+								if k == "siwc" || k == "use_siwc" || codexauth.IsCodexExpirationKey(k) || codexauth.IsCodexRefreshTimeKey(k) {
 									continue
 								}
 								auth.Metadata[k] = val
@@ -418,11 +452,14 @@ func (e *CodexExecutor) refreshLocked(ctx context.Context, auth *cliproxyauth.Au
 								clonedAttributes[k] = v
 							}
 							for k, v := range refreshed.Attributes {
+								if codexauth.IsCodexRefreshTimeKey(k) {
+									continue
+								}
 								clonedAttributes[k] = v
 							}
 							auth.Attributes = clonedAttributes
 						}
-						helps.AdoptCodexHomeIdentity(auth, refreshed)
+						helps.AdoptCodexHomeIdentity(auth, identity)
 					}
 				}
 			}
@@ -452,7 +489,8 @@ func (e *CodexExecutor) refreshLocked(ctx context.Context, auth *cliproxyauth.Au
 					}
 				}
 				auth.Metadata["email"] = td.Email
-				auth.Metadata["expired"] = td.Expire
+				cliproxyauth.ReplaceCodexOuterExpiration(auth.Metadata, map[string]any{"expired": td.Expire}, false)
+				cliproxyauth.ReplaceCodexOuterRefreshTime(auth, &cliproxyauth.Auth{}, false)
 				auth.Metadata["type"] = "codex"
 				auth.Metadata["last_refresh"] = time.Now().Format(time.RFC3339)
 
@@ -479,13 +517,6 @@ func (e *CodexExecutor) refreshLocked(ctx context.Context, auth *cliproxyauth.Au
 				clonedAttributes["plan_type"] = planType
 				clonedAttributes["plan_type_defaulted"] = strconv.FormatBool(planTypeDefaulted)
 				auth.Attributes = clonedAttributes
-				if storage, ok := auth.Storage.(*codexauth.CodexTokenStorage); ok && storage != nil {
-					clonedStorage := *storage
-					svc.UpdateTokenStorage(&clonedStorage, td)
-					clonedStorage.PlanType = planType
-					clonedStorage.PlanTypeDefaulted = planTypeDefaulted
-					auth.Storage = &clonedStorage
-				}
 			}
 		}
 	}
@@ -496,40 +527,23 @@ func (e *CodexExecutor) refreshLocked(ctx context.Context, auth *cliproxyauth.Au
 			siwcErr = errSIWC
 		} else if siwcTD != nil {
 			siwcRefreshed = true
-			mergedSIWC := cloneSIWCMap(existingSIWC)
-			if mergedSIWC == nil {
-				mergedSIWC = make(map[string]any)
+			localSIWC := siwcTD.ToMap()
+			existingSIWC = helps.AdoptCodexHomeSIWC(existingSIWC, localSIWC)
+			if _, present := localSIWC["earliest_refresh_at"]; !present {
+				delete(existingSIWC, "earliest_refresh_at")
 			}
-			delete(mergedSIWC, "expires_at")
-			delete(mergedSIWC, "earliest_refresh_at")
-			for k, v := range siwcTD.ToMap() {
-				mergedSIWC[k] = v
-			}
-			existingSIWC = mergedSIWC
 		}
 	}
 
-	// Always preserve use_siwc and siwc fields on both Metadata and Storage.
+	// Preserve route selection alongside the accepted credential partitions.
 	if hasPreservedUseSIWC {
 		auth.Metadata["use_siwc"] = preservedUseSIWC
 	}
 	if len(existingSIWC) > 0 {
 		auth.Metadata["siwc"] = cloneSIWCMap(existingSIWC)
 	}
-	if storage, ok := auth.Storage.(*codexauth.CodexTokenStorage); ok && storage != nil {
-		clonedStorage := *storage
-		if hasPreservedUseSIWC {
-			if b, okBool := preservedUseSIWC.(bool); okBool {
-				clonedStorage.UseSIWC = &b
-			}
-		}
-		if len(existingSIWC) > 0 {
-			clonedStorage.SIWC = cloneSIWCMap(existingSIWC)
-		}
-		auth.Storage = &clonedStorage
-	}
 
-	if !outerRefreshed && !siwcRefreshed && !diskRotatedOuter && !diskRotatedSIWC {
+	if !outerRefreshed && !siwcRefreshed && !siwcAdopted && !diskRotatedOuter && !diskRotatedSIWC {
 		if errCombined := codexauth.NewPartitionRefreshError(outerErr, siwcErr); errCombined != nil {
 			return nil, errCombined
 		}
@@ -542,15 +556,13 @@ func (e *CodexExecutor) refreshLocked(ctx context.Context, auth *cliproxyauth.Au
 		log.Warnf("codex executor: outer token refreshed but SIWC token refresh failed for %s: %v", auth.ID, siwcErr)
 	}
 
-	patch := codexauth.NewCredentialRefreshPatchWithDiskBaseline(beforeRefresh.Metadata, diskBaseline, auth.Metadata, outerRefreshed || diskRotatedOuter, siwcRefreshed || diskRotatedSIWC)
+	patch := codexauth.NewCredentialRefreshPatchWithDiskBaseline(beforeRefresh.Metadata, diskBaseline, auth.Metadata, outerRefreshed || diskRotatedOuter, siwcRefreshed || siwcAdopted || diskRotatedSIWC)
 	patch.SetUpstreamRefreshed(outerRefreshed || siwcRefreshed)
 	patch.SetPartitionErrors(outerErr, siwcErr)
-	auth.CodexRefreshPatch = patch
-	if storage, ok := auth.Storage.(*codexauth.CodexTokenStorage); ok && storage != nil {
-		clonedStorage := *storage
-		clonedStorage.RefreshPatch = patch
-		auth.Storage = &clonedStorage
+	if siwcErr != nil {
+		patch.SetFailedSIWCRefreshToken(siwcRefreshToken)
 	}
+	auth.CodexRefreshPatch = patch
 	if diskPath != "" {
 		latestBytes, errReadLatest := os.ReadFile(diskPath)
 		if errReadLatest != nil {

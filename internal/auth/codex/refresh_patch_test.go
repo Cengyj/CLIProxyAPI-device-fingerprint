@@ -1,6 +1,76 @@
 package codex
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/MoeForge/moego/json"
+)
+
+func TestCredentialDiskSnapshotComparisonIgnoresRepresentationAndSettings(t *testing.T) {
+	before := map[string]any{
+		"access_token": "outer", "refresh_token": "outer-grant", "expires_in": int64(7200),
+		"timestamp": int64(1795747200), "token": map[string]any{"expires_at": int64(1795754400), "custom": "old"},
+		"codex_device_fingerprint": "off", "codex_installation_id": "old-override",
+		"siwc": map[string]any{"access_token": "nested", "refresh_token": "nested-grant", "expires_in": int64(7200), "scopes": []string{"openid"}},
+	}
+	raw, err := json.Marshal(before)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var disk map[string]any
+	if err = json.Unmarshal(raw, &disk); err != nil {
+		t.Fatal(err)
+	}
+	disk["codex_device_fingerprint"], disk["codex_installation_id"] = "device", "new-override"
+	disk["token"].(map[string]any)["custom"] = "new"
+	nested := disk["siwc"].(map[string]any)
+	nested["access"] = nested["access_token"]
+	delete(nested, "access_token")
+	nested["operator_note"] = "edited"
+	if !SameOuterCredentialSnapshot(before, disk) || !SameSIWCCredentialSnapshot(before["siwc"].(map[string]any), nested) {
+		t.Fatal("a JSON round trip, access alias or administrator edit invented a credential rotation")
+	}
+	disk["token"].(map[string]any)["expires_at"] = float64(1795758000)
+	if SameOuterCredentialSnapshot(before, disk) {
+		t.Fatal("a nested outer expiry update was ignored")
+	}
+	nested["scopes"] = []any{"openid", "offline_access"}
+	if SameSIWCCredentialSnapshot(before["siwc"].(map[string]any), nested) {
+		t.Fatal("a SIWC registration update was ignored")
+	}
+}
+
+func TestCredentialRefreshPatchSIWCRemovalKeepsConcurrentRotation(t *testing.T) {
+	before := map[string]any{
+		"access_token": "outer-old", "refresh_token": "outer-grant",
+		"siwc": map[string]any{"access_token": "nested-old", "refresh_token": "nested-grant", "device_id": "old-device"},
+	}
+	after := map[string]any{"access_token": "outer-new", "refresh_token": "outer-new-grant"}
+	patch := NewCredentialRefreshPatchWithDiskBaseline(before, after, after, true, true)
+	for _, currentState := range []string{"matching", "already-removed", "rebound"} {
+		t.Run(currentState, func(t *testing.T) {
+			current := cloneStringAnyMap(before)
+			current["operator_note"] = "keep"
+			switch currentState {
+			case "already-removed":
+				delete(current, "siwc")
+			case "rebound":
+				current["siwc"] = map[string]any{"access_token": "new-binding", "refresh_token": "new-binding-grant", "device_id": "new-device"}
+			}
+			got := patch.Apply(current)
+			if got["access_token"] != "outer-new" || got["operator_note"] != "keep" {
+				t.Fatal("SIWC removal prevented independent outer adoption or lost administrator metadata")
+			}
+			if currentState == "rebound" {
+				if got["siwc"].(map[string]any)["access_token"] != "new-binding" {
+					t.Fatal("old partition removal deleted a newer SIWC binding")
+				}
+			} else if _, present := got["siwc"]; present {
+				t.Fatal("matched removal restored a SIWC partition")
+			}
+		})
+	}
+}
 
 func TestCodexDeviceFingerprintRefreshPatchKeepsIdentityWithCredentialVersion(t *testing.T) {
 	before := map[string]any{
@@ -97,6 +167,30 @@ func TestCredentialRefreshPatchChecksPartitionsIndependently(t *testing.T) {
 			saved := patch.Apply(disk)
 			if saved["refresh_token"] != wantOuter || saved["siwc"].(map[string]any)["refresh_token"] != wantSIWC {
 				t.Fatalf("partition version check lost a valid refresh or overwrote a bind: %#v", saved)
+			}
+		})
+	}
+}
+
+func TestCredentialRefreshPatchSIWCLegacyAccess(t *testing.T) {
+	record := func(key, bearer string) map[string]any {
+		return map[string]any{"siwc": map[string]any{key: bearer, "refresh_token": "same-grant"}}
+	}
+	before := record("access", "old")
+	patch := NewCredentialRefreshPatch(before, record("access", "new"), false, true)
+	for _, key := range []string{"access_token", "access"} {
+		t.Run(key, func(t *testing.T) {
+			matching := record(key, "old")
+			if !patch.CanApplyTo(matching) {
+				t.Fatal("patch rejected a matching baseline encoded with the other spelling")
+			}
+			sub := patch.Apply(matching)["siwc"].(map[string]any)
+			if _, legacy := sub["access"]; legacy || sub["access_token"] != "new" || sub["refresh_token"] != "same-grant" {
+				t.Fatal("matching baseline did not receive the canonical SIWC pair")
+			}
+			newer := record(key, "newer")
+			if patch.CanApplyTo(newer) || patch.Apply(newer)["siwc"].(map[string]any)[key] != "newer" {
+				t.Fatal("stale refresh overwrote a newer bearer with the same grant")
 			}
 		})
 	}

@@ -29,6 +29,9 @@ func (w *Watcher) stopConfigReloadTimer() {
 func (w *Watcher) scheduleConfigReload() {
 	w.configReloadMu.Lock()
 	defer w.configReloadMu.Unlock()
+	if w.stopped.Load() {
+		return
+	}
 	if w.configReloadTimer != nil {
 		w.configReloadTimer.Stop()
 	}
@@ -53,6 +56,12 @@ func (w *Watcher) reloadConfigIfChanged() {
 	// not apply after a newer one.
 	w.configApplyMu.Lock()
 	defer w.configApplyMu.Unlock()
+	if w.stopped.Load() {
+		return
+	}
+	// A symlink may move to a target with identical bytes. Update its watches
+	// even when the content hash below correctly suppresses a runtime reload.
+	w.syncConfigTargetWatch()
 
 	data, err := config.ReadConfigFile(w.configPath)
 	if err != nil {
@@ -74,7 +83,7 @@ func (w *Watcher) reloadConfigIfChanged() {
 		return
 	}
 	log.Infof("config file changed, reloading: %s", w.configPath)
-	if w.reloadConfig() {
+	if w.reloadConfig() && !w.stopped.Load() {
 		// Record the bytes the reload actually parsed, not the change-check read or a
 		// later re-read: a write landing between them must not count as applied. A
 		// write-back during load only costs one extra reload.
@@ -90,12 +99,20 @@ func (w *Watcher) reloadConfigIfChanged() {
 }
 
 func (w *Watcher) reloadConfig() bool {
+	if w.stopped.Load() {
+		return false
+	}
 	log.Debug("=========================== CONFIG RELOAD ============================")
 	log.Debugf("starting config reload from: %s", w.configPath)
 
 	newConfig, errLoadConfig := loadConfigFileFunc(w.configPath)
 	if errLoadConfig != nil {
 		log.Errorf("failed to reload config: %v", errLoadConfig)
+		return false
+	}
+	// Stop cannot cancel a filesystem read already in progress. Discard its
+	// result instead of replacing runtime executors during service shutdown.
+	if w.stopped.Load() {
 		return false
 	}
 
@@ -114,6 +131,11 @@ func (w *Watcher) reloadConfig() bool {
 
 	w.authRescanMu.Lock()
 	w.clientsMutex.Lock()
+	if w.stopped.Load() {
+		w.clientsMutex.Unlock()
+		w.authRescanMu.Unlock()
+		return false
+	}
 	var oldConfig *config.Config
 	_ = yaml.Unmarshal(w.oldConfigYaml, &oldConfig)
 	prevAuthDir := w.authDir

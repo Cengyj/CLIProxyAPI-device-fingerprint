@@ -11,6 +11,7 @@ import (
 	"sync"
 
 	"github.com/MoeForge/moego/json"
+	baseauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/misc"
 	log "github.com/sirupsen/logrus"
 )
@@ -107,7 +108,7 @@ func WriteJSONFileAtomic(authFilePath string, data map[string]any) error {
 	return nil
 }
 
-var codexOuterCredentialKeys = []string{
+var codexOuterCredentialKeys = append([]string{
 	"id_token",
 	"access_token",
 	"refresh_token",
@@ -115,11 +116,13 @@ var codexOuterCredentialKeys = []string{
 	"chatgpt_user_id",
 	"chatgpt_plan_type",
 	"last_refresh",
+	"lastRefresh",
+	"last_refreshed_at",
+	"lastRefreshedAt",
 	"email",
-	"expired",
 	"plan_type",
 	"plan_type_defaulted",
-}
+}, baseauth.CredentialExpirationMetadataKeys()...)
 
 func cloneStringAnyMap(src map[string]any) map[string]any {
 	if src == nil {
@@ -175,6 +178,9 @@ func MergeWithDiskMap(diskMap, incomingMap map[string]any) map[string]any {
 			delete(merged, key)
 		}
 	}
+	if len(diskMap) > 0 {
+		ReplaceExpirationFields(merged, diskMap)
+	}
 	if _, exists := diskMap["siwc"]; !exists && len(diskMap) > 0 {
 		delete(merged, "siwc")
 	}
@@ -209,6 +215,7 @@ func MergeCodexCredentialsFromDisk(diskMap, incomingMetadata map[string]any) map
 				delete(merged, key)
 			}
 		}
+		ReplaceExpirationFields(merged, diskMap)
 	} else {
 		for _, key := range codexOuterCredentialKeys {
 			if value, exists := diskMap[key]; exists {
@@ -227,6 +234,8 @@ func MergeCodexCredentialsFromDisk(diskMap, incomingMetadata map[string]any) map
 		} else {
 			merged["siwc"] = value
 		}
+	} else if len(diskMap) > 0 {
+		delete(merged, "siwc")
 	}
 	if value, exists := diskMap["use_siwc"]; exists {
 		if _, specified := incomingMetadata["use_siwc"]; !specified {
@@ -269,6 +278,8 @@ type CodexTokenStorage struct {
 	ReplaceCredentials bool `json:"-"`
 	// RefreshPatch updates only refreshed partitions during a direct storage save.
 	RefreshPatch *CredentialRefreshPatch `json:"-"`
+	// ExistingFilePath protects the original source while allowing explicit copies.
+	ExistingFilePath string `json:"-"`
 
 	// Metadata holds arbitrary key-value pairs injected via hooks.
 	// It is not exported to JSON directly to allow flattening during serialization.
@@ -280,6 +291,34 @@ func (ts *CodexTokenStorage) SetMetadata(meta map[string]any) {
 	ts.Metadata = meta
 }
 
+// WithMetadataSnapshot returns independent storage for an accepted credential
+// snapshot, including explicit clears and legacy fields carried in metadata.
+func (ts *CodexTokenStorage) WithMetadataSnapshot(metadata map[string]any) *CodexTokenStorage {
+	if ts == nil {
+		return nil
+	}
+	metadata = cloneStringAnyMap(metadata)
+	text := func(key string) string {
+		value, _ := metadata[key].(string)
+		return value
+	}
+	snapshot := &CodexTokenStorage{
+		IDToken: text("id_token"), AccessToken: text("access_token"), RefreshToken: text("refresh_token"),
+		AccountID: text("account_id"), LastRefresh: text("last_refresh"), Email: text("email"),
+		Type: text("type"), Expire: text("expired"), PlanType: text("plan_type"),
+		ReplaceCredentials: ts.ReplaceCredentials, RefreshPatch: ts.RefreshPatch,
+		ExistingFilePath: ts.ExistingFilePath, Metadata: metadata,
+	}
+	snapshot.PlanTypeDefaulted, _ = metadata["plan_type_defaulted"].(bool)
+	if useSIWC, ok := metadata["use_siwc"].(bool); ok {
+		snapshot.UseSIWC = &useSIWC
+	}
+	if siwc, ok := metadata["siwc"].(map[string]any); ok {
+		snapshot.SIWC = cloneStringAnyMap(siwc)
+	}
+	return snapshot
+}
+
 // SaveTokenToFile serializes the Codex token storage to a JSON file under a per-file and inter-process lock,
 // reading and merging any existing JSON on disk before atomically replacing the file.
 func (ts *CodexTokenStorage) SaveTokenToFile(authFilePath string) error {
@@ -287,6 +326,7 @@ func (ts *CodexTokenStorage) SaveTokenToFile(authFilePath string) error {
 	ts.Type = "codex"
 
 	return WithFileLock(authFilePath, func() error {
+		requireExisting := ts.ExistingFilePath != "" && canonicalLockPath(ts.ExistingFilePath) == canonicalLockPath(authFilePath)
 		data, errMerge := misc.MergeMetadata(ts, ts.Metadata)
 		if errMerge != nil {
 			return fmt.Errorf("failed to merge metadata: %w", errMerge)
@@ -296,10 +336,16 @@ func (ts *CodexTokenStorage) SaveTokenToFile(authFilePath string) error {
 		if errRead != nil && !os.IsNotExist(errRead) {
 			return fmt.Errorf("failed to read existing credentials: %w", errRead)
 		}
+		if os.IsNotExist(errRead) && (requireExisting || ts.RefreshPatch.RequiresExistingFile(authFilePath)) {
+			return fmt.Errorf("credential source removed: %w", errRead)
+		}
 		if errRead == nil {
 			var diskMap map[string]any
 			if errUnmarshal := json.Unmarshal(existingBytes, &diskMap); errUnmarshal != nil || diskMap == nil {
 				return fmt.Errorf("invalid existing credential JSON")
+			}
+			if requireExisting && len(diskMap) == 0 {
+				return fmt.Errorf("empty existing credential JSON")
 			}
 			if ts.RefreshPatch != nil {
 				return WriteJSONFileAtomic(authFilePath, ts.RefreshPatch.Apply(diskMap))
@@ -315,6 +361,7 @@ func (ts *CodexTokenStorage) SaveTokenToFile(authFilePath string) error {
 						delete(merged, key)
 					}
 				}
+				ReplaceExpirationFields(merged, diskMap)
 			}
 			if ts.ReplaceCredentials {
 				for _, key := range codexOuterCredentialKeys {
@@ -324,6 +371,7 @@ func (ts *CodexTokenStorage) SaveTokenToFile(authFilePath string) error {
 						delete(merged, key)
 					}
 				}
+				ReplaceExpirationFields(merged, data)
 			}
 			data = merged
 		}

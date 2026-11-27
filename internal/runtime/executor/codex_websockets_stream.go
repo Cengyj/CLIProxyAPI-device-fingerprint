@@ -1058,6 +1058,7 @@ func (e *CodexWebsocketsExecutor) prepareCodexWebsocketStreamWithDevice(ctx cont
 	wsHeaders = applyCodexWebsocketHeaders(ctx, wsHeaders, auth, apiKey, e.cfg, preserveNativeOutput, opts.Headers)
 	applyCodexRoutingHint(ctx, wsHeaders, auth, upstreamModel, body, opts.Headers)
 	applyModelHeaderOverrides(wsHeaders, upstreamModel)
+	helps.FinalizeCodexWebsocketHeaders(wsHeaders)
 	if errValidate := helps.ValidateCodexHostedImageGenerationDoc(doc, wsHeaders, e.cfg, !useSIWC && !codexAuthUsesAPIKey(auth)); errValidate != nil {
 		return nil, errValidate
 	}
@@ -1073,7 +1074,7 @@ func (e *CodexWebsocketsExecutor) prepareCodexWebsocketStreamWithDevice(ctx cont
 		wsURL:                wsURL,
 		wsHeaders:            wsHeaders,
 		useSIWC:              useSIWC,
-		device:               codexWebsocketDeviceSnapshot{policy: devicePolicy, identity: devicePolicy.Identity(doc, wsHeaders)},
+		device:               codexWebsocketDeviceSnapshot{policy: devicePolicy, identity: devicePolicy.IdentityForHandshake(doc, wsHeaders, apiKey)},
 		replayScope:          replayScope,
 		optimizeMultiAgentV2: optimizeMultiAgentV2,
 		multiAgentV2Conflict: multiAgentV2Conflict,

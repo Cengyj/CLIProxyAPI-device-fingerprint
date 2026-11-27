@@ -1091,6 +1091,113 @@ func IsCodexUseSIWCForRequest(ctx context.Context, a *Auth, clientHeaders ...htt
 	return true
 }
 
+// ReplaceCodexOuterExpiration copies the source expiry as one credential field,
+// so a previously used, higher-priority spelling cannot mask its replacement.
+func ReplaceCodexOuterExpiration(target, source map[string]any, sameBearer bool) {
+	codex.MergeNonExpirationFields(target, target, source)
+	fields := codex.ExpirationFields(source)
+	if sameBearer && len(fields) == 0 {
+		return
+	}
+	expiry, hasExpiry := expirationFromMap(fields)
+	codex.ReplaceExpirationFields(target, nil)
+	hasAbsolute := false
+	for _, key := range baseauth.ExpirationMetadataKeys() {
+		if value, exists := fields[key]; exists {
+			target[key] = value
+			if _, valid := parseTimeValue(value); valid {
+				hasAbsolute = true
+			}
+		}
+	}
+	if !hasAbsolute && hasExpiry {
+		// Resolve relative and legacy nested timestamps against their own
+		// supplied issue time before later refresh timestamps can change.
+		target["expired"] = expiry.UTC().Format(time.RFC3339Nano)
+	}
+}
+
+// ReplaceCodexOuterRefreshTime adopts the timestamp used to schedule unknown
+// lifetimes, preserving omitted timestamps only for the same bearer.
+func ReplaceCodexOuterRefreshTime(target, source *Auth, sameBearer bool) {
+	keys := codex.RefreshTimeMetadataKeys()
+	var rawTimestamp any
+	provided := false
+	for _, key := range keys {
+		if value, present := source.Metadata[key]; present {
+			rawTimestamp, provided = value, true
+			break
+		}
+	}
+	if !provided {
+		for _, key := range keys {
+			if value, present := source.Attributes[key]; present {
+				rawTimestamp, provided = value, true
+				break
+			}
+		}
+	}
+	if sameBearer && !provided {
+		// An unchanged credential may have its only durable timestamp in
+		// legacy Attributes. Promote it before removing auxiliary copies.
+		for _, key := range keys {
+			if value, present := target.Metadata[key]; present {
+				rawTimestamp, provided = value, true
+				break
+			}
+		}
+		if !provided {
+			for _, key := range keys {
+				if value, present := target.Attributes[key]; present {
+					rawTimestamp, provided = value, true
+					break
+				}
+			}
+		}
+		if !provided {
+			return
+		}
+	}
+	timestamp, known := parseTimeValue(rawTimestamp)
+	attributes := make(map[string]string, len(target.Attributes))
+	for key, value := range target.Attributes {
+		attributes[key] = value
+	}
+	for _, key := range keys {
+		delete(target.Metadata, key)
+		delete(attributes, key)
+	}
+	target.Attributes = attributes
+	target.LastRefreshedAt = time.Time{}
+	if known {
+		target.Metadata["last_refresh"] = timestamp.UTC().Format(time.RFC3339Nano)
+	}
+}
+
+// ReplaceCodexSIWCExpiration persists real and legacy buffered expiries without
+// applying an additional safety margin or borrowing another bearer's lifetime.
+func ReplaceCodexSIWCExpiration(target, current, source map[string]any, sameBearer bool) {
+	fields := codex.ExpirationFields(source)
+	if sameBearer && len(fields) == 0 {
+		// Resolve the original relative lifetime before a sparse update can
+		// replace or omit the timestamp used as its calculation base.
+		source = current
+	}
+	candidate := &Auth{Metadata: map[string]any{"siwc": source}}
+	realExpiry, hasRealExpiry := candidate.SIWCRealExpirationTime()
+	legacyExpiry, hasLegacyExpiry := parseTimeValue(source["expired"])
+	if !hasLegacyExpiry && !hasRealExpiry {
+		legacyExpiry, hasLegacyExpiry = expirationFromMap(source)
+	}
+	codex.ReplaceExpirationFields(target, nil)
+	if hasRealExpiry {
+		target["expires_at"] = realExpiry.UTC().Format(time.RFC3339Nano)
+	}
+	if hasLegacyExpiry {
+		target["expired"] = legacyExpiry.UTC().Format(time.RFC3339Nano)
+	}
+}
+
 // OuterExpirationTime extracts the outer credential expiration timestamp, ignoring the nested "siwc" section.
 func (a *Auth) OuterExpirationTime() (time.Time, bool) {
 	if a == nil {
@@ -1155,8 +1262,8 @@ const (
 )
 
 // SIWCRealExpirationTime extracts the real (unbuffered) expiration timestamp for the nested
-// "siwc" access token. It reads "expires_at" (saved from OAuth expires_in) or the JWT "exp"
-// claim of "access_token", without using the margin-deducted "expired" field.
+// "siwc" access token. The JWT "exp" takes precedence over real absolute and
+// relative metadata, without using the margin-deducted "expired" field.
 func (a *Auth) SIWCRealExpirationTime() (time.Time, bool) {
 	if a == nil || a.Metadata == nil {
 		return time.Time{}, false
@@ -1165,17 +1272,17 @@ func (a *Auth) SIWCRealExpirationTime() (time.Time, bool) {
 	if !ok || len(siwcMap) == 0 {
 		return time.Time{}, false
 	}
-	if ts, okExp := lookupMetadataTime(siwcMap, "expires_at", "expiresAt"); okExp && !ts.IsZero() {
+	if rawToken := codex.SIWCAccessToken(siwcMap); rawToken != "" {
+		if jwtExp, okJWT := parseJWTExp(rawToken); okJWT && !jwtExp.IsZero() {
+			return jwtExp, true
+		}
+	}
+	if ts, okExp := lookupMetadataTime(siwcMap, "expires_at", "expiresAt", "expire", "expiry", "expires"); okExp && !ts.IsZero() {
 		return ts, true
 	}
 	if expiresIn, okExpiresIn := parseRelativeExpirySeconds(siwcMap); okExpiresIn {
 		if ts, okTs := lookupMetadataTime(siwcMap, "last_refresh", "lastRefresh", "timestamp", "issued_at", "issuedAt"); okTs && !ts.IsZero() {
 			return ts.Add(time.Duration(expiresIn) * time.Second), true
-		}
-	}
-	if rawToken, okTok := siwcMap["access_token"].(string); okTok && strings.TrimSpace(rawToken) != "" {
-		if jwtExp, okJWT := parseJWTExp(rawToken); okJWT && !jwtExp.IsZero() {
-			return jwtExp, true
 		}
 	}
 	return time.Time{}, false
@@ -1228,12 +1335,21 @@ func (a *Auth) SIWCExpirationTime() (time.Time, bool) {
 	if ts, okExp := expirationFromMap(siwcMap); okExp && !ts.IsZero() {
 		return ts, true
 	}
-	if rawToken, okTok := siwcMap["access_token"].(string); okTok && strings.TrimSpace(rawToken) != "" {
+	if rawToken := codex.SIWCAccessToken(siwcMap); rawToken != "" {
 		if jwtExp, okJWT := parseJWTExp(rawToken); okJWT && !jwtExp.IsZero() {
 			return jwtExp, true
 		}
 	}
 	return time.Time{}, false
+}
+
+// SIWCRenewalExpirationTime prefers the real SIWC expiry; older credentials
+// may only have the margin-deducted expired field.
+func (a *Auth) SIWCRenewalExpirationTime() (time.Time, bool) {
+	if expiry, ok := a.SIWCRealExpirationTime(); ok {
+		return expiry, true
+	}
+	return a.SIWCExpirationTime()
 }
 
 // CodexOuterNeedsRefresh evaluates the outer credential refresh due time and whether it needs refresh at now.
@@ -1360,15 +1476,10 @@ func CodexSIWCNeedsRefresh(a *Auth, now time.Time) (dueAt time.Time, hasRefresh 
 		return time.Time{}, false, false
 	}
 
-	siwcToken, _ := siwcMap["access_token"].(string)
-	siwcToken = strings.TrimSpace(siwcToken)
+	siwcToken := codex.SIWCAccessToken(siwcMap)
 	due := now
 	if siwcToken != "" && !a.isSIWCAccessTokenRejected(siwcToken) {
-		// The legacy expired field already includes a margin; prefer the real expiry.
-		expiry, hasExpiry := a.SIWCRealExpirationTime()
-		if !hasExpiry {
-			expiry, hasExpiry = a.SIWCExpirationTime()
-		}
+		expiry, hasExpiry := a.SIWCRenewalExpirationTime()
 		if hasExpiry && !expiry.IsZero() {
 			due = expiry.Add(-CodexSIWCRefreshLead)
 		} else if lastRefresh, okLast := lookupMetadataTime(siwcMap, "last_refresh", "lastRefresh"); okLast && !lastRefresh.IsZero() {
@@ -1556,13 +1667,11 @@ func RegisterRefreshLeadProvider(provider string, factory func() *time.Duration)
 	refreshLeadMu.Unlock()
 }
 
-var expireKeys = [...]string{"expired", "expire", "expires_at", "expiresAt", "expiry", "expires"}
-
 func expirationFromMap(meta map[string]any) (time.Time, bool) {
 	if meta == nil {
 		return time.Time{}, false
 	}
-	for _, key := range expireKeys {
+	for _, key := range baseauth.ExpirationMetadataKeys() {
 		if v, ok := meta[key]; ok {
 			if ts, ok1 := parseTimeValue(v); ok1 {
 				return ts, true
@@ -1574,7 +1683,7 @@ func expirationFromMap(meta map[string]any) (time.Time, bool) {
 			return timestamp.Add(time.Duration(expiresIn) * time.Second), true
 		}
 	}
-	for _, nestedKey := range []string{"token", "Token"} {
+	for _, nestedKey := range baseauth.NestedExpirationMetadataKeys() {
 		if nested, ok := meta[nestedKey]; ok {
 			switch val := nested.(type) {
 			case map[string]any:
@@ -1655,7 +1764,7 @@ func parseJWTExp(token string) (time.Time, bool) {
 }
 
 func parseRelativeExpirySeconds(meta map[string]any) (int, bool) {
-	for _, key := range []string{"expires_in", "expiresIn"} {
+	for _, key := range baseauth.RelativeExpirationMetadataKeys() {
 		if value, ok := meta[key]; ok {
 			if seconds, okSeconds := parseIntAny(value); okSeconds && seconds > 0 {
 				return seconds, true
@@ -1666,7 +1775,7 @@ func parseRelativeExpirySeconds(meta map[string]any) (int, bool) {
 }
 
 func parseRelativeExpiryTimestamp(meta map[string]any) (time.Time, bool) {
-	for _, key := range []string{"timestamp", "issued_at", "issuedAt"} {
+	for _, key := range baseauth.ExpirationTimestampMetadataKeys() {
 		if value, ok := meta[key]; ok {
 			if timestamp, okTimestamp := parseTimeValue(value); okTimestamp && !timestamp.IsZero() {
 				return timestamp, true

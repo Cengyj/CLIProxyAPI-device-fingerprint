@@ -38,6 +38,7 @@ type Watcher struct {
 	watchMu                    sync.Mutex
 	started                    bool
 	watchedAuthDir             string
+	watchedConfigTarget        string // Resolved symlink target; guarded by watchMu.
 	config                     *config.Config
 	clientsMutex               sync.RWMutex
 	authRescanMu               sync.Mutex

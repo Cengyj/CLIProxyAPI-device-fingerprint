@@ -42,6 +42,9 @@ func MergeExistingAuthMetadata(target *Auth, existingMap map[string]any) {
 			continue
 		}
 		if strings.EqualFold(strings.TrimSpace(target.Provider), "codex") {
+			if codex.IsCodexExpirationKey(k) || codex.IsCodexRefreshTimeKey(k) {
+				continue
+			}
 			// These hints belong to the acquired outer credential. Re-login
 			// must not inherit an earlier account or member from custom metadata.
 			switch CanonicalCredentialMetadataKey(k) {
@@ -64,6 +67,9 @@ func MergeExistingAuthMetadata(target *Auth, existingMap map[string]any) {
 		if _, exists := target.Metadata[k]; !exists {
 			target.Metadata[k] = v
 		}
+	}
+	if strings.EqualFold(strings.TrimSpace(target.Provider), "codex") {
+		codex.MergeNonExpirationFields(target.Metadata, nil, existingMap)
 	}
 	if setter, ok := target.Storage.(interface{ SetMetadata(map[string]any) }); ok {
 		setter.SetMetadata(target.Metadata)
@@ -313,6 +319,7 @@ func mergeAuthContent(base, current, updated *Auth) *Auth {
 	}
 
 	if updated.CodexRefreshPatch != nil {
+		codex.MergeNonExpirationFields(merged.Metadata, baseMeta, updated.Metadata)
 		merged.Metadata = updated.CodexRefreshPatch.Apply(merged.Metadata)
 	}
 
@@ -417,6 +424,9 @@ func mergeAuthContent(base, current, updated *Auth) *Auth {
 			baseAttrs = base.Attributes
 		}
 		for k, v := range updated.Attributes {
+			if updated.CodexRefreshPatch != nil && codex.IsCodexRefreshTimeKey(k) {
+				continue
+			}
 			baseVal, hadInBase := baseAttrs[k]
 			currentVal, hadInCurrent := current.Attributes[k]
 
@@ -429,6 +439,9 @@ func mergeAuthContent(base, current, updated *Auth) *Auth {
 		}
 		if baseAttrs != nil {
 			for k, baseVal := range baseAttrs {
+				if updated.CodexRefreshPatch != nil && codex.IsCodexRefreshTimeKey(k) {
+					continue
+				}
 				if _, inUpdated := updated.Attributes[k]; !inUpdated {
 					if currentVal, ok := current.Attributes[k]; ok {
 						if baseVal == currentVal {
@@ -461,5 +474,14 @@ func mergeAuthContent(base, current, updated *Auth) *Auth {
 		}
 	}
 
+	if updated.CodexRefreshPatch != nil {
+		if storage, ok := merged.Storage.(*codex.CodexTokenStorage); ok && storage != nil {
+			// A refresh can win only one partition. The typed storage must
+			// reflect the same accepted versions and settings as the metadata.
+			snapshot := storage.WithMetadataSnapshot(merged.Metadata)
+			snapshot.RefreshPatch = updated.CodexRefreshPatch
+			merged.Storage = snapshot
+		}
+	}
 	return merged
 }

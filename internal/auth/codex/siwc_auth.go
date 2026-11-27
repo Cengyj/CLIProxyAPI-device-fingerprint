@@ -359,7 +359,14 @@ func (o *CodexAuth) RefreshSIWCTokens(ctx context.Context, refreshToken, clientI
 	if !ok || tokenData == nil {
 		return nil, WrapSIWCRefreshError(fmt.Errorf("SIWC token refresh failed: invalid single-flight result"))
 	}
-	return tokenData, nil
+	// The grant result is shared across callers and recovery receipts. DeviceID
+	// is caller-owned registration metadata, never returned by the token endpoint.
+	// Keep the current setting without changing the shared result or replaying
+	// a grant merely because a local device setting changed.
+	current := *tokenData
+	current.DeviceID = strings.TrimSpace(deviceID)
+	current.Scopes = slices.Clone(tokenData.Scopes)
+	return &current, nil
 }
 
 // RefreshSIWCTokensWithRetry refreshes SIWC tokens with exponential backoff.

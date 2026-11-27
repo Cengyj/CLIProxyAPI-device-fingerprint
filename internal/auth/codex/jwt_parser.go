@@ -57,23 +57,77 @@ type CodexAuthInfo struct {
 // contents to retrieve user information from an ID token after it has been validated
 // by the authentication server.
 func ParseJWTToken(token string) (*JWTClaims, error) {
+	var claims JWTClaims
+	// JWT audiences may be a single string or a list. Decode this union
+	// separately without changing the public claims shape or other type checks.
+	type claimsFields JWTClaims
+	wire := struct {
+		*claimsFields
+		Audience json.RawMessage `json:"aud"`
+	}{claimsFields: (*claimsFields)(&claims)}
+	if errDecode := decodeJWTClaims(token, &wire); errDecode != nil {
+		return nil, errDecode
+	}
+	if len(wire.Audience) != 0 {
+		if errAudience := json.Unmarshal(wire.Audience, &claims.Aud); errAudience != nil {
+			var audience string
+			if errString := json.Unmarshal(wire.Audience, &audience); errString != nil {
+				return nil, fmt.Errorf("failed to unmarshal JWT audience: %w", errAudience)
+			}
+			claims.Aud = []string{audience}
+		}
+	}
+	return &claims, nil
+}
+
+// JWTSubject contains only stable identity claims used for socket reuse. SIWC
+// tokens may use an OIDC subject without the ChatGPT claim namespace.
+type JWTSubject struct {
+	Issuer  string
+	Subject string
+	Account string
+	User    string
+}
+
+// ParseJWTSubject inspects identity claims independently of optional claims
+// such as aud (which may be either a string or a list). No token is retained.
+func ParseJWTSubject(token string) (JWTSubject, bool) {
+	var claims struct {
+		Issuer  string `json:"iss"`
+		Subject string `json:"sub"`
+		Auth    struct {
+			Account string `json:"chatgpt_account_id"`
+			User    string `json:"chatgpt_user_id"`
+			UserID  string `json:"user_id"`
+		} `json:"https://api.openai.com/auth"`
+	}
+	if decodeJWTClaims(token, &claims) != nil {
+		return JWTSubject{}, false
+	}
+	user := strings.TrimSpace(claims.Auth.User)
+	if user == "" {
+		user = strings.TrimSpace(claims.Auth.UserID)
+	}
+	subject := JWTSubject{Issuer: strings.TrimSpace(claims.Issuer), Subject: strings.TrimSpace(claims.Subject), Account: strings.TrimSpace(claims.Auth.Account), User: user}
+	return subject, subject.Subject != "" || subject.User != ""
+}
+
+func decodeJWTClaims(token string, claims any) error {
 	parts := strings.Split(token, ".")
 	if len(parts) != 3 {
-		return nil, fmt.Errorf("invalid JWT token format: expected 3 parts, got %d", len(parts))
+		return fmt.Errorf("invalid JWT token format: expected 3 parts, got %d", len(parts))
 	}
 
 	// Decode the claims (payload) part
 	claimsData, err := base64URLDecode(parts[1])
 	if err != nil {
-		return nil, fmt.Errorf("failed to decode JWT claims: %w", err)
+		return fmt.Errorf("failed to decode JWT claims: %w", err)
 	}
 
-	var claims JWTClaims
-	if err = json.Unmarshal(claimsData, &claims); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal JWT claims: %w", err)
+	if err = json.Unmarshal(claimsData, claims); err != nil {
+		return fmt.Errorf("failed to unmarshal JWT claims: %w", err)
 	}
-
-	return &claims, nil
+	return nil
 }
 
 // base64URLDecode decodes a Base64 URL-encoded string, adding padding if necessary.

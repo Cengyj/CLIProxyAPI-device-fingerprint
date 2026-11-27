@@ -19,6 +19,7 @@ import (
 func TestCodexDeviceFingerprintHomeRefreshIdentity(t *testing.T) {
 	const memberA = "2d1c341a-5607-4894-ae5e-6cf59c2e7dde"
 	const memberB = "fd5de10e-f853-4dd0-92f4-ece041b115a9"
+	const noIdentity = "e1adc2d3-5830-4ecd-b4ad-dcc4dd155b9a"
 	for _, test := range []struct {
 		name                    string
 		metadata                map[string]any
@@ -109,7 +110,7 @@ func TestCodexDeviceFingerprintHomeRefreshIdentity(t *testing.T) {
 			name:       "explicit absence clears auxiliary account and token",
 			metadata:   map[string]any{"account_id": "", "id_token": ""},
 			attributes: map[string]string{"account_id": "acc-team-2", "id_token": codexDeviceTestToken(t, "acc-team-2", "user-bbb", "team")},
-			plan:       "free", defaulted: true, id: memberA,
+			plan:       "free", defaulted: true, id: noIdentity,
 		},
 		{
 			name:     "explicit free",
@@ -128,7 +129,7 @@ func TestCodexDeviceFingerprintHomeRefreshIdentity(t *testing.T) {
 		},
 		{
 			name:    "all identity absent",
-			account: "", plan: "free", defaulted: true, id: memberA,
+			account: "", plan: "free", defaulted: true, id: noIdentity,
 		},
 		{
 			name:       "auxiliary token belongs to another account",
@@ -146,7 +147,12 @@ func TestCodexDeviceFingerprintHomeRefreshIdentity(t *testing.T) {
 			name:       "null canonical member blocks auxiliary member",
 			metadata:   map[string]any{"account_id": "acc-team-1", "id_token": codexDeviceTestToken(t, "acc-team-1", "", "team"), "chatgpt_user_id": nil},
 			attributes: map[string]string{"account_id": "acc-team-1", "chatgpt_user_id": "user-bbb"},
-			account:    "acc-team-1", plan: "team", id: memberA,
+			account:    "acc-team-1", plan: "team", id: noIdentity,
+		},
+		{
+			name:     "omitted canonical member preserves compatible cached member",
+			metadata: map[string]any{"account_id": "acc-team-1", "id_token": codexDeviceTestToken(t, "acc-team-1", "", "team")},
+			account:  "acc-team-1", plan: "team", id: memberA,
 		},
 		{
 			name:       "cleared canonical plan blocks auxiliary plan",
@@ -169,7 +175,7 @@ func TestCodexDeviceFingerprintHomeRefreshIdentity(t *testing.T) {
 			name:       "malformed canonical identity blocks auxiliary recovery",
 			metadata:   map[string]any{"account_id": 12, "id_token": false, "chatgpt_user_id": []any{}, "chatgpt_plan_type": nil, "plan_type": nil},
 			attributes: map[string]string{"account_id": "acc-team-2", "id_token": codexDeviceTestToken(t, "acc-team-2", "user-bbb", "team"), "chatgpt_user_id": "user-bbb", "plan_type": "team"},
-			plan:       "free", defaulted: true, id: memberA,
+			plan:       "free", defaulted: true, id: noIdentity,
 		},
 		{
 			name:       "empty member and plan do not inherit auxiliary fields",
@@ -231,6 +237,11 @@ func TestCodexDeviceFingerprintHomeRefreshIdentity(t *testing.T) {
 			}
 			if got, _ := adopted.Metadata["chatgpt_user_id"].(string); got != test.user {
 				t.Fatalf("adopted member mismatch")
+			}
+			if _, explicit := test.metadata["chatgpt_user_id"]; explicit && test.user == "" {
+				if marker, exists := adopted.Metadata["chatgpt_user_id"]; !exists || marker != "" {
+					t.Fatal("explicit member clear did not survive adoption")
+				}
 			}
 			if got := adopted.Metadata["plan_type"]; got != test.plan {
 				t.Fatalf("plan = %v, want %v", got, test.plan)

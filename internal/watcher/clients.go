@@ -26,6 +26,9 @@ import (
 )
 
 func (w *Watcher) reloadClients(rescanAuth bool, affectedOAuthProviders []string, forceAuthRefresh bool) {
+	if w.stopped.Load() {
+		return
+	}
 	log.Debugf("starting full client load process")
 
 	w.clientsMutex.RLock()
@@ -213,6 +216,11 @@ func (w *Watcher) reloadClients(rescanAuth bool, affectedOAuthProviders []string
 
 	totalNewClients := authFileCount + geminiAPIKeyCount + vertexCompatAPIKeyCount + claudeAPIKeyCount + codexAPIKeyCount + xaiAPIKeyCount + metaAPIKeyCount + openAICompatCount
 
+	// A plugin auth parser or filesystem scan may have outlived Stop. Do not
+	// rebuild runtime clients after the service has started shutting down.
+	if w.stopped.Load() {
+		return
+	}
 	if w.reloadCallback != nil {
 		log.Debugf("triggering server update callback before auth refresh")
 		w.reloadCallback(cfg)

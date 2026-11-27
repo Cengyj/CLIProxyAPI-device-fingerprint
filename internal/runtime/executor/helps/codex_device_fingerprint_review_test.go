@@ -5,6 +5,7 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/MoeForge/moego/base64"
 	"github.com/MoeForge/moego/ojson"
 )
 
@@ -58,6 +59,86 @@ func TestCodexDeviceFingerprintFrozenTeamMemberAndRefresh(t *testing.T) {
 	refreshed.Metadata["chatgpt_user_id"] = "member-b"
 	if resolver.CompatibleFrozenAuth(policy, refreshed, false, codexDeviceTestURL) {
 		t.Fatal("different Team member reused explicit device on old socket")
+	}
+}
+
+func TestCodexDeviceFingerprintFrozenSIWCSubject(t *testing.T) {
+	oidc := func(subject string, issuedAt int, changes ...map[string]any) string {
+		doc := ojson.NewDocString(`{"iss":"https://issuer.invalid","aud":"siwc-client","https://api.openai.com/auth":{"chatgpt_account_id":"workspace"}}`)
+		if errSet := doc.Set("https://api\\.openai\\.com/auth.chatgpt_user_id", subject); errSet != nil {
+			t.Fatal(errSet)
+		}
+		if errSet := doc.Set("sub", subject); errSet != nil {
+			t.Fatal(errSet)
+		}
+		if errSet := doc.Set("iat", issuedAt); errSet != nil {
+			t.Fatal(errSet)
+		}
+		for _, fields := range changes {
+			for field, value := range fields {
+				if errSet := doc.Set(field, value); errSet != nil {
+					t.Fatal(errSet)
+				}
+			}
+		}
+		return "eyJhbGciOiJub25lIn0." + base64.RawURLEncoding.EncodeToString(doc.Bytes()) + ".sig"
+	}
+	memberA := codexDeviceTestToken(t, "workspace", "a", "team")
+	memberB := codexDeviceTestToken(t, "workspace", "b", "team")
+	for _, tc := range []struct {
+		name, oldBearer, oldID, bearer, id string
+		reuse                              bool
+	}{
+		{"member-rotates-bearer", "old", memberA, "new", memberA, true},
+		{"member-changes", "old", memberA, "new", memberB, false},
+		{"oidc-only-subject-changes", "old", oidc("a", 1, map[string]any{"https://api\\.openai\\.com/auth": nil}), "new", oidc("b", 2, map[string]any{"https://api\\.openai\\.com/auth": nil}), false},
+		{"oidc-only-token-reissued", "old", oidc("a", 1, map[string]any{"https://api\\.openai\\.com/auth": nil}), "new", oidc("a", 2, map[string]any{"https://api\\.openai\\.com/auth": nil}), true},
+		{"oidc-subject-changes", "old", oidc("a", 1), "new", oidc("b", 2), false},
+		{"oidc-token-reissued", "old", oidc("a", 1), "new", oidc("a", 2), true},
+		{"bearer-same-member-without-id", oidc("a", 1), memberA, oidc("a", 2), "", true},
+		{"bearer-new-member-without-id", oidc("a", 1), memberA, oidc("b", 2), "", false},
+		{"bearer-new-issuer-without-id", oidc("a", 1), memberA, oidc("a", 2, map[string]any{"iss": "https://other.invalid"}), "", false},
+		{"bearer-new-account-without-id", oidc("a", 1), memberA, oidc("a", 2, map[string]any{"https://api\\.openai\\.com/auth.chatgpt_account_id": "other"}), "", false},
+		{"bearer-new-subject-without-id", oidc("a", 1), memberA, oidc("a", 2, map[string]any{"sub": "other"}), "", false},
+		{"bearer-new-user-without-id", oidc("a", 1), memberA, oidc("a", 2, map[string]any{"https://api\\.openai\\.com/auth.chatgpt_user_id": "other"}), "", false},
+		{"conflicting-id-member", oidc("a", 1), memberA, oidc("a", 2), memberB, false},
+		{"conflicting-id-issuer", oidc("a", 1), oidc("a", 1), oidc("a", 2), oidc("a", 2, map[string]any{"iss": "https://other.invalid"}), false},
+		{"incomplete-bearer-needs-id", oidc("a", 1, map[string]any{"https://api\\.openai\\.com/auth.chatgpt_user_id": ""}), memberA, oidc("a", 2, map[string]any{"https://api\\.openai\\.com/auth.chatgpt_user_id": ""}), "", false},
+		{"bearer-identifies-new-member", memberA, memberA, memberB, memberA, false},
+		{"opaque-workspace-changes", "same", codexDeviceTestToken(t, "one", "", "team"), "same", codexDeviceTestToken(t, "two", "", "team"), false},
+		{"workspace-only-cannot-identify-member", "old", codexDeviceTestToken(t, "one", "", "team"), "new", codexDeviceTestToken(t, "one", "", "team"), false},
+		{"same-opaque-bearer", "old", "", "old", "", true},
+		{"unidentifiable-rotated-bearer", "old", "", "new", "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := codexDeviceTestConfig()
+			original := codexDeviceTestAuth("same-record", "outer-account")
+			original.Metadata["siwc"] = map[string]any{"device_id": codexDeviceTestID, "access_token": tc.oldBearer, "id_token": tc.oldID}
+			next := original.Clone()
+			next.Metadata["siwc"] = map[string]any{"device_id": codexDeviceTestID, "access_token": tc.bearer, "id_token": tc.id}
+			var resolver CodexDeviceResolver
+			bound := resolver.Resolve(cfg, original, true, codexDeviceTestURL)
+			candidate := resolver.Resolve(cfg, next, true, codexDeviceTestURL)
+			if bound.ID != codexDeviceTestID || candidate.ID != bound.ID {
+				t.Fatal("selected SIWC device ID changed")
+			}
+			if got := resolver.CompatibleFrozenAuth(bound, next, true, codexDeviceTestURL); got != tc.reuse {
+				t.Errorf("frozen subject compatible = %t, want %t", got, tc.reuse)
+			}
+			if got := bound.Identity(nil, nil).CompatibleHandshake(candidate.Identity(nil, nil)); got != tc.reuse {
+				t.Errorf("handshake compatible = %t, want %t", got, tc.reuse)
+			}
+			if resolver.CompatibleFrozenAuth(bound, next, false, codexDeviceTestURL) {
+				t.Error("selected credential partition change reused frozen SIWC policy")
+			}
+			// With SIWC selected, a change confined to the outer credential
+			// must not displace the socket authenticated by the nested bearer.
+			next = original.Clone()
+			next.Metadata["account_id"] = "other-outer-account"
+			if !resolver.CompatibleFrozenAuth(bound, next, true, codexDeviceTestURL) {
+				t.Error("outer account change invalidated the selected SIWC credential")
+			}
+		})
 	}
 }
 
@@ -199,5 +280,28 @@ func TestCodexDeviceFingerprintConflictingMemberInvalidatesHints(t *testing.T) {
 	}
 	if got := resolver.Resolve(cfg, empty, false, codexDeviceTestURL); got.ID != want {
 		t.Fatal("new confirmed identity was not retained")
+	}
+}
+
+func TestCodexDeviceFingerprintClearedIdentityInvalidatesHints(t *testing.T) {
+	cfg := codexDeviceTestConfig()
+	auth := codexDeviceTestAuth("cleared-record", "workspace")
+	auth.Metadata["id_token"] = codexDeviceTestToken(t, "workspace", "member", "team")
+	var resolver CodexDeviceResolver
+	previous := resolver.Resolve(cfg, auth, false, codexDeviceTestURL)
+	cleared := codexDeviceTestAuth(auth.ID, "")
+	cleared.Metadata["id_token"] = ""
+	cleared.Metadata["access_token"] = "replacement-without-claims"
+	want := codexDeviceUUID("auth-id\x00" + auth.ID)
+	if got := resolver.Resolve(cfg, cleared, false, codexDeviceTestURL); got.ID != want || got.ID == previous.ID {
+		t.Fatal("explicitly cleared credential reused the cached member")
+	}
+	delete(cleared.Metadata, "id_token")
+	delete(cleared.Metadata, "account_id")
+	if got := resolver.Resolve(cfg, cleared, false, codexDeviceTestURL); got.ID != want {
+		t.Fatal("later missing fields resurrected the cleared member")
+	}
+	if len(resolver.entries) != 0 || resolver.recent.Len() != 0 {
+		t.Fatal("cleared identity remained in the cache")
 	}
 }

@@ -216,9 +216,20 @@ func TestCodexDeviceFingerprintHomeRefreshToWire(t *testing.T) {
 				delete(returned.Metadata, "account_id")
 				delete(returned.Metadata, "id_token")
 			}
+			// Account and team-member switches can belong to the same CPA record.
+			if tc.name == "new-account" || tc.name == "same-explicit-new-member" {
+				returned.ID = auth.ID
+			}
 			envelope := ojson.NewDocString(`{}`)
 			if errSet := envelope.Set("auth", returned); errSet != nil {
 				t.Fatal(errSet)
+			}
+			wantIndex := auth.Index
+			if tc.name == "new-account" {
+				wantIndex = "home-updated-index"
+				if errSet := envelope.Set("auth_index", wantIndex); errSet != nil {
+					t.Fatal(errSet)
+				}
 			}
 			var refreshCalls atomic.Int32
 			helps.SetHomeRefreshForTest(t, func(_ context.Context, index, digest string) ([]byte, error) {
@@ -238,6 +249,9 @@ func TestCodexDeviceFingerprintHomeRefreshToWire(t *testing.T) {
 			merged, errMerge := manager.UpdateRefreshedAuth(t.Context(), auth, refreshed)
 			if errMerge != nil {
 				t.Fatal(errMerge)
+			}
+			if refreshed.ID != auth.ID || merged.ID != auth.ID || refreshed.Index != wantIndex {
+				t.Error("Home refresh lost the record ID or returned index")
 			}
 			if errExecute := execute(false, homeBusinessBody); errExecute != nil {
 				t.Fatal(errExecute)
