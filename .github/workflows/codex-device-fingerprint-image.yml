@@ -119,6 +119,10 @@ jobs:
           docker push "$IMAGE:$IMAGE_TAG"
           docker push "$IMAGE:latest-amd64"
           docker buildx imagetools inspect "$IMAGE:$IMAGE_TAG" | tee image-manifest.txt
+          docker pull "$IMAGE:$IMAGE_TAG"
+          digest="$(docker image inspect "$IMAGE:$IMAGE_TAG" --format '{{index .RepoDigests 0}}')"
+          docker run --rm --network none "$digest" ./CLIProxyAPI -h > image-pulled-help.log 2>&1
+          grep -F "Commit: $GITHUB_SHA" image-pulled-help.log
           {
             echo "Image: $IMAGE:$IMAGE_TAG"
             echo "Rolling tag: $IMAGE:latest-amd64"
@@ -137,4 +141,5 @@ jobs:
             image-health.json
             image-startup.log
             image-manifest.txt
+            image-pulled-help.log
           if-no-files-found: ignore
