@@ -292,11 +292,13 @@ controls. Helper files live in `helps/`, not alongside executor implementations.
 | `config.example.yaml` / `oauth.providers.codex` | Describe defaults and opt-in behavior without changing real configuration. |
 | `internal/config/config_types.go` / `CodexConfig` | Add mode string and optional inject boolean. Keep automatic OAuth mapping; do not move them under shared upstream settings. |
 | `internal/config/config_yaml.go` / `renderConfigSave`, `isKnownDefaultValue` | Preserve newly added explicit inject false and its provider mapping; remove the saved field when the optional value returns to nil. Clearing mode must also remove the old saved mode instead of retaining device through the comment-preserving merge. |
-| `internal/watcher/synthesizer/file.go` / `synthesizeFileAuths` | Label parser-defaulted free in synthesized attributes while preserving existing plan defaults and explicit values. |
-| `internal/auth/codex/openai.go`, `token.go` / token data, storage and outer credential allowlist; `openai_auth.go` / exchange, refresh, storage creation/update; `refresh_journal.go` / `decodeRefreshReceipt` | Carry source provenance with refreshed credentials, including false to clear prior true; never substitute a token-derived default for an explicit plan. |
-| `internal/auth/codex/refresh_patch.go` / `CanApplyOuterTo`; `sdk/cliproxy/auth/metadata_merge.go` / `mergeAuthContent` | Check the outer credential version separately from SIWC before accepting refreshed identity hints. Keep Metadata and auxiliary Attributes with the accepted outer credentials; preserve valid independent SIWC refreshes. |
-| `sdk/auth/codex_device.go` / `buildAuthRecord` | Copy plan provenance to initial login storage, Metadata and Attributes; raw explicit token plans clear defaulted provenance. |
-| `internal/runtime/executor/codex_executor_auth.go` / `refreshLocked` | Preserve plan provenance through refresh/save; adopting rotated disk credentials replaces/clears old account/member/token/plan metadata and auxiliary attributes together, without changing administrator device overrides. |
+| `internal/watcher/synthesizer/file.go` / `synthesizeFileAuths` | Label parser-defaulted free in synthesized attributes while preserving existing plan defaults and explicit values. A foreign-account JWT cannot supply the selected account's plan. |
+| `internal/auth/codex/openai.go`, `token.go` / token data, `SaveTokenToFile` and outer credential allowlist, `openai_auth.go` / exchange, refresh, storage creation/update, `refresh_journal.go` / `decodeRefreshReceipt` | Carry source provenance with refreshed credentials, including false to clear prior true. Persist member and claim-plan hints with the selected credential partition. Ordinary saves retain administrator edits/deletions, re-login clears absent old credential fields, and an empty disk object preserves incoming credentials. Preserve existing access-token-only replacement semantics. |
+| `internal/auth/codex/refresh_patch.go` / `CanApplyOuterTo`, `Apply`, `applyCredentialFields`, `sdk/cliproxy/auth/metadata_merge.go` / `mergeAuthContent`, `MergeExistingAuthMetadata` | Validate the outer credential version before adopting or clearing identity fields, independently of SIWC. Keep Metadata and auxiliary Attributes with accepted outer credentials. Codex re-login inherits administrator settings while excluding the previous credential's identity hints. Other providers retain their merge behavior. |
+| `sdk/auth/codex_device.go` / `buildAuthRecord` | Populate account, JWT, member and plan hints from the acquired credential, with matching-account validation and plan-default provenance. These fields must survive Storage flattening and existing-file metadata merging. |
+| `sdk/cliproxy/auth/codex_persist.go` / `PersistCodexAuthFile`, `synchronizeCodexIdentityAttributes` | Keep the returned Metadata, auxiliary Attributes and Storage consistent with the actually persisted credential partition. Clone shared auxiliary state and preserve administrator device/header settings. File, Postgres, Git and ObjectStore call this boundary. |
+| `internal/runtime/executor/codex_executor_auth.go` / `refreshLocked` | Local OAuth refresh and rotated-disk adoption replace or clear account/member/token/plan hints together in Metadata and Attributes. Preserve plan-default provenance, bounded missing-claim recovery and administrator overrides. |
+| `internal/runtime/executor/helps/home_refresh.go` / `AdoptCodexHomeIdentity` | Adopt the returned Home credential's identity after its overlay. Clear inherited absent hints, validate token-account agreement and retain administrator/SIWC settings. The remote producer protocol requires separate integration validation. |
 | `internal/watcher/diff/config_diff.go` / `BuildConfigChangeDetails` | Expose hot reload changes using bounded/sanitized mode descriptions and optional boolean values, with no device/account data. |
 | `internal/runtime/executor/codex_executor.go` / `CodexExecutor`, `NewCodexExecutor` | Own bounded resolver state for the executor lifetime, never a global current ID. |
 | `internal/runtime/executor/codex_executor_request.go` / `cacheHelper`, `cacheHelperDoc` | Resolve selected auth/route once, validate ambiguity, mutate the same Doc before `FinalizePayloadDoc`; carry snapshot on the resulting request context through compression fallback. |
@@ -357,12 +359,16 @@ Independent implementation files:
   singleton keys, final non-string/duplicate device identities, newly observed
   business-frame identity, rotated disk members, Manager partition/version merging,
   stale storage save/reload and clearing/removing overrides.
+- `sdk/auth/codex_device_fingerprint_integration_test.go` exercises actual login
+  record construction, SDK Manager login, persistence, synthesis, Manager
+  registration and captured HTTP requests. The existing identity/persistence tests
+  also cover actual mock OAuth refresh, current/legacy receipts, member/account
+  changes and ordinary Metadata/Storage saves through the selected executor.
 
 Inspected but intentionally unchanged: `config_v8.go`, `oauth_scope.go`,
 `oauth_scope_executor.go` (API-key views share a resolver pointer instead of copying
 a mutex), `codex_executor_tokens.go` (local CountTokens), `helps/payload_finalizer.go`,
-`helps/codex_session_instructions.go`, and
-`sdk/cliproxy/auth/codex_persist.go`. Upgrade review must revisit these dependencies
+`helps/codex_session_instructions.go`. Upgrade review must revisit these dependencies
 as well as changed files, especially if a request path stops using the shared
 builder or moves the final barrier.
 
@@ -462,6 +468,12 @@ Patch commit list:
    document and its `.gitignore` exception.
 3. The subsequent strict-review fix and documentation commits are listed in the
    follow-up record below.
+4. `6291e9cae8f4615d833f9833f06777adaf148306` synchronizes credential identity
+   across OAuth/Home refresh, ordinary persistence, re-login and versioned merges.
+   Its final local verification on 2026-11-27 passed the full suite, feature race
+   checks in seven affected packages, affected-package vet and the server build.
+   Local HTTP/WS captures verify adopted tokens and identities. Actual deployment,
+   remote storage services and the remote Home producer remain unverified.
 
 New test count: 40 top-level `TestCodexDeviceFingerprint*` tests with table-driven
 subtests. Required feature tests, the five named payload/session regressions,
