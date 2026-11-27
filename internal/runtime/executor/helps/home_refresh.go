@@ -94,38 +94,111 @@ func AdoptCodexHomeIdentity(target, source *cliproxyauth.Auth) {
 	if target == nil || source == nil {
 		return
 	}
-	identityString := func(key string) string {
-		if raw, exists := source.Metadata[key]; exists {
-			value, _ := raw.(string)
-			return strings.TrimSpace(value)
+	metadataString := func(key string) (string, bool) {
+		raw, exists := source.Metadata[key]
+		value, _ := raw.(string)
+		return strings.TrimSpace(value), exists
+	}
+	token, tokenPresent := metadataString("id_token")
+	claims, _ := codexauth.ParseJWTToken(token)
+	account, accountPresent := metadataString("account_id")
+	if !accountPresent {
+		// A canonical token can supply an omitted canonical account before
+		// consulting an auxiliary snapshot of the previous credential.
+		if claims != nil {
+			account = strings.TrimSpace(claims.CodexAuthInfo.ChatgptAccountID)
 		}
-		return strings.TrimSpace(source.Attributes[key])
+		if account == "" {
+			account = strings.TrimSpace(source.Attributes["account_id"])
+		}
 	}
-	account := identityString("account_id")
-	token := identityString("id_token")
-	member := identityString("chatgpt_user_id")
-	claimPlan := identityString("chatgpt_plan_type")
-	plan := identityString("plan_type")
-	defaulted, hasDefaulted := source.Metadata["plan_type_defaulted"].(bool)
-	if !hasDefaulted {
-		defaulted = strings.EqualFold(strings.TrimSpace(source.Attributes["plan_type_defaulted"]), "true")
+	// An explicitly empty, null or mistyped canonical field blocks auxiliary
+	// fallback. Absence still supports legacy Attributes-only Home responses.
+	auxiliary := !accountPresent || account != ""
+	if auxiliaryAccount := strings.TrimSpace(source.Attributes["account_id"]); auxiliaryAccount != "" && auxiliaryAccount != account {
+		auxiliary = false
 	}
-	if claims, errParse := codexauth.ParseJWTToken(token); errParse == nil && claims != nil {
+	if !tokenPresent && auxiliary {
+		token = strings.TrimSpace(source.Attributes["id_token"])
+		claims, _ = codexauth.ParseJWTToken(token)
+	}
+	if tokenPresent && token == "" {
+		auxiliary = false
+	}
+	claimMember, tokenPlan := "", ""
+	if claims != nil {
 		claimAccount := strings.TrimSpace(claims.CodexAuthInfo.ChatgptAccountID)
 		if account == "" {
 			account = claimAccount
 		}
 		if claimAccount == "" || claimAccount == account {
-			if member == "" {
-				member = strings.TrimSpace(claims.CodexAuthInfo.ChatgptUserID)
-			}
-			if claimPlan == "" {
-				claimPlan = strings.TrimSpace(claims.CodexAuthInfo.ChatgptPlanType)
+			claimMember = strings.TrimSpace(claims.CodexAuthInfo.ChatgptUserID)
+			tokenPlan = strings.TrimSpace(claims.CodexAuthInfo.ChatgptPlanType)
+		} else {
+			auxiliary = false
+			if !tokenPresent {
+				// A rejected auxiliary token must not become a canonical field
+				// merely because its claims were ignored during resolution.
+				token = ""
 			}
 		}
 	}
+	if auxiliaryToken := strings.TrimSpace(source.Attributes["id_token"]); auxiliaryToken != "" {
+		if claims, errParse := codexauth.ParseJWTToken(auxiliaryToken); errParse == nil && claims != nil {
+			claimAccount := strings.TrimSpace(claims.CodexAuthInfo.ChatgptAccountID)
+			if claimAccount != "" && claimAccount != account {
+				auxiliary = false
+			}
+		}
+	}
+	identityHint := func(key, claim string) string {
+		if value, present := metadataString(key); present {
+			return value
+		}
+		// Claims from the adopted, matching-account token precede auxiliary
+		// hints, which may still describe the previous member of that account.
+		if claim != "" {
+			return claim
+		}
+		if auxiliary {
+			return strings.TrimSpace(source.Attributes[key])
+		}
+		return ""
+	}
+	member := identityHint("chatgpt_user_id", claimMember)
+	plan, planPresent := metadataString("plan_type")
+	claimPlan, claimPlanPresent := metadataString("chatgpt_plan_type")
+	if !claimPlanPresent {
+		claimPlan = tokenPlan
+		if claimPlan == "" && !planPresent && auxiliary {
+			claimPlan = strings.TrimSpace(source.Attributes["chatgpt_plan_type"])
+		}
+	}
+	defaulted := false
+	if planPresent {
+		// The provenance marker belongs to the same source as the plan.
+		// Legacy explicit free without a boolean true remains explicit free.
+		defaulted, _ = source.Metadata["plan_type_defaulted"].(bool)
+	} else {
+		plan, _ = metadataString("chatgpt_plan_type")
+		if plan == "" && tokenPresent {
+			plan = tokenPlan
+		}
+		if plan == "" && !claimPlanPresent && auxiliary {
+			plan = strings.TrimSpace(source.Attributes["plan_type"])
+			defaulted = strings.EqualFold(strings.TrimSpace(source.Attributes["plan_type_defaulted"]), "true")
+		}
+		if plan == "" {
+			plan = claimPlan
+		}
+	}
 	if plan == "" {
-		plan = claimPlan
+		// A cleared plan may still be derived from the adopted token, but
+		// cannot revive a plan from an auxiliary source through claim-plan.
+		plan, _ = metadataString("chatgpt_plan_type")
+		if plan == "" {
+			plan = tokenPlan
+		}
 		defaulted = plan == ""
 		if defaulted {
 			plan = codexauth.DefaultPlanType
@@ -256,7 +329,17 @@ func parseHomeRefreshAuth(raw []byte) (*cliproxyauth.Auth, string, error) {
 	if errUnmarshal := json.Unmarshal(raw, &rawObject); errUnmarshal != nil {
 		return nil, "", errUnmarshal
 	}
-	if _, ok := rawObject["auth"]; ok {
+	if len(rawObject) == 0 {
+		return nil, "", errors.New("empty auth object")
+	}
+	if authRaw, ok := rawObject["auth"]; ok {
+		var authObject map[string]json.RawMessage
+		if errUnmarshal := json.Unmarshal(authRaw, &authObject); errUnmarshal != nil {
+			return nil, "", errUnmarshal
+		}
+		if len(authObject) == 0 {
+			return nil, "", errors.New("empty auth envelope")
+		}
 		var envelope homeRefreshAuthEnvelope
 		if errUnmarshal := json.Unmarshal(raw, &envelope); errUnmarshal != nil {
 			return nil, "", errUnmarshal

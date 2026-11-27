@@ -62,6 +62,17 @@ func NewCodexAutoExecutor(cfg *config.Config) *CodexAutoExecutor {
 
 func (e *CodexAutoExecutor) Identifier() string { return "codex" }
 
+func (e *CodexAutoExecutor) ShouldPrepareRequestAuth(auth *cliproxyauth.Auth) bool {
+	return e != nil && e.httpExec != nil && e.httpExec.ShouldPrepareRequestAuth(auth)
+}
+
+func (e *CodexAutoExecutor) PrepareRequestAuth(ctx context.Context, auth *cliproxyauth.Auth) (*cliproxyauth.Auth, error) {
+	if e == nil || e.httpExec == nil {
+		return auth, nil
+	}
+	return e.httpExec.PrepareRequestAuth(ctx, auth)
+}
+
 // UsesConfig reports whether the executor was created for cfg.
 func (e *CodexAutoExecutor) UsesConfig(cfg *config.Config) bool {
 	return e != nil && e.httpExec != nil && e.httpExec.cfg == cfg

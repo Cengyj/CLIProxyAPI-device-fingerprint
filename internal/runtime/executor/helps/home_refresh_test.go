@@ -27,6 +27,54 @@ func TestCodexDeviceFingerprintHomeRefreshIdentity(t *testing.T) {
 		defaulted               bool
 	}{
 		{
+			name:       "metadata free does not inherit auxiliary default provenance",
+			metadata:   map[string]any{"account_id": "acc-team-1", "id_token": codexDeviceTestToken(t, "acc-team-1", "user-aaa", ""), "plan_type": "free"},
+			attributes: map[string]string{"plan_type": "free", "plan_type_defaulted": "true"},
+			account:    "acc-team-1", user: "user-aaa", plan: "free", id: "c2a63432-aabe-4908-8fe6-ec89af8327c9",
+		},
+		{
+			name:       "metadata false clears auxiliary default provenance",
+			metadata:   map[string]any{"account_id": "acc-team-1", "id_token": codexDeviceTestToken(t, "acc-team-1", "user-aaa", ""), "plan_type": "free", "plan_type_defaulted": false},
+			attributes: map[string]string{"plan_type": "free", "plan_type_defaulted": "true"},
+			account:    "acc-team-1", user: "user-aaa", plan: "free", id: "c2a63432-aabe-4908-8fe6-ec89af8327c9",
+		},
+		{
+			name:       "null metadata provenance is not auxiliary provenance",
+			metadata:   map[string]any{"account_id": "acc-team-1", "id_token": codexDeviceTestToken(t, "acc-team-1", "user-aaa", ""), "plan_type": "free", "plan_type_defaulted": nil},
+			attributes: map[string]string{"plan_type": "free", "plan_type_defaulted": "true"},
+			account:    "acc-team-1", user: "user-aaa", plan: "free", id: "c2a63432-aabe-4908-8fe6-ec89af8327c9",
+		},
+		{
+			name:       "invalid metadata provenance is not auxiliary provenance",
+			metadata:   map[string]any{"account_id": "acc-team-1", "id_token": codexDeviceTestToken(t, "acc-team-1", "user-aaa", ""), "plan_type": "free", "plan_type_defaulted": "true"},
+			attributes: map[string]string{"plan_type": "free", "plan_type_defaulted": "true"},
+			account:    "acc-team-1", user: "user-aaa", plan: "free", id: "c2a63432-aabe-4908-8fe6-ec89af8327c9",
+		},
+		{
+			name:       "foreign auxiliary member cannot shadow adopted token",
+			metadata:   map[string]any{"account_id": "acc-team-1", "id_token": codexDeviceTestToken(t, "acc-team-1", "user-bbb", "team")},
+			attributes: map[string]string{"account_id": "acc-team-2", "chatgpt_user_id": "user-aaa", "plan_type": "team"},
+			account:    "acc-team-1", user: "user-bbb", plan: "team", id: memberB,
+		},
+		{
+			name:       "same account auxiliary member cannot shadow adopted token",
+			metadata:   map[string]any{"account_id": "acc-team-1", "id_token": codexDeviceTestToken(t, "acc-team-1", "user-bbb", "team")},
+			attributes: map[string]string{"account_id": "acc-team-1", "chatgpt_user_id": "user-aaa", "plan_type": "team"},
+			account:    "acc-team-1", user: "user-bbb", plan: "team", id: memberB,
+		},
+		{
+			name:       "canonical token supplies missing account before auxiliary account",
+			metadata:   map[string]any{"id_token": codexDeviceTestToken(t, "acc-team-1", "user-bbb", "team")},
+			attributes: map[string]string{"account_id": "acc-team-2", "chatgpt_user_id": "user-aaa", "plan_type": "team"},
+			account:    "acc-team-1", user: "user-bbb", plan: "team", id: memberB,
+		},
+		{
+			name:       "foreign auxiliary plan cannot supply missing claim",
+			metadata:   map[string]any{"account_id": "acc-test-1", "id_token": codexDeviceTestToken(t, "acc-test-1", "", "")},
+			attributes: map[string]string{"account_id": "acc-team-2", "chatgpt_user_id": "user-aaa", "plan_type": "team"},
+			account:    "acc-test-1", plan: "free", defaulted: true, id: "e1e46a26-def3-4e3e-9ee2-185e59ed0444",
+		},
+		{
 			name:     "new member",
 			metadata: map[string]any{"account_id": "acc-team-1", "id_token": codexDeviceTestToken(t, "acc-team-1", "user-bbb", "team")},
 			account:  "acc-team-1", user: "user-bbb", plan: "team", id: memberB,
@@ -81,6 +129,53 @@ func TestCodexDeviceFingerprintHomeRefreshIdentity(t *testing.T) {
 		{
 			name:    "all identity absent",
 			account: "", plan: "free", defaulted: true, id: memberA,
+		},
+		{
+			name:       "auxiliary token belongs to another account",
+			metadata:   map[string]any{"account_id": "acc-test-1"},
+			attributes: map[string]string{"id_token": codexDeviceTestToken(t, "acc-team-2", "user-bbb", "team"), "chatgpt_user_id": "user-bbb", "plan_type": "team"},
+			account:    "acc-test-1", plan: "free", defaulted: true, id: "e1e46a26-def3-4e3e-9ee2-185e59ed0444",
+		},
+		{
+			name:       "cleared canonical token blocks auxiliary member",
+			metadata:   map[string]any{"account_id": "acc-test-1", "id_token": nil},
+			attributes: map[string]string{"account_id": "acc-test-1", "id_token": codexDeviceTestToken(t, "acc-test-1", "user-bbb", "team"), "chatgpt_user_id": "user-bbb", "plan_type": "team"},
+			account:    "acc-test-1", plan: "free", defaulted: true, id: "e1e46a26-def3-4e3e-9ee2-185e59ed0444",
+		},
+		{
+			name:       "null canonical member blocks auxiliary member",
+			metadata:   map[string]any{"account_id": "acc-team-1", "id_token": codexDeviceTestToken(t, "acc-team-1", "", "team"), "chatgpt_user_id": nil},
+			attributes: map[string]string{"account_id": "acc-team-1", "chatgpt_user_id": "user-bbb"},
+			account:    "acc-team-1", plan: "team", id: memberA,
+		},
+		{
+			name:       "cleared canonical plan blocks auxiliary plan",
+			metadata:   map[string]any{"account_id": "acc-test-1", "id_token": codexDeviceTestToken(t, "acc-test-1", "", ""), "plan_type": nil, "chatgpt_plan_type": nil},
+			attributes: map[string]string{"account_id": "acc-test-1", "plan_type": "team", "chatgpt_plan_type": "team"},
+			account:    "acc-test-1", plan: "free", defaulted: true, id: "e1e46a26-def3-4e3e-9ee2-185e59ed0444",
+		},
+		{
+			name:       "legacy auxiliary explicit free retains source provenance",
+			attributes: map[string]string{"account_id": "acc-team-1", "id_token": codexDeviceTestToken(t, "acc-team-1", "user-aaa", "team"), "chatgpt_plan_type": "team", "plan_type": "free", "plan_type_defaulted": "false"},
+			account:    "acc-team-1", user: "user-aaa", plan: "free", id: "c2a63432-aabe-4908-8fe6-ec89af8327c9",
+		},
+		{
+			name:       "empty default marker remains explicit free",
+			metadata:   map[string]any{"account_id": "acc-team-1", "plan_type": "free", "plan_type_defaulted": ""},
+			attributes: map[string]string{"plan_type": "free", "plan_type_defaulted": "true"},
+			account:    "acc-team-1", plan: "free", id: "c2a63432-aabe-4908-8fe6-ec89af8327c9",
+		},
+		{
+			name:       "malformed canonical identity blocks auxiliary recovery",
+			metadata:   map[string]any{"account_id": 12, "id_token": false, "chatgpt_user_id": []any{}, "chatgpt_plan_type": nil, "plan_type": nil},
+			attributes: map[string]string{"account_id": "acc-team-2", "id_token": codexDeviceTestToken(t, "acc-team-2", "user-bbb", "team"), "chatgpt_user_id": "user-bbb", "plan_type": "team"},
+			plan:       "free", defaulted: true, id: memberA,
+		},
+		{
+			name:       "empty member and plan do not inherit auxiliary fields",
+			metadata:   map[string]any{"account_id": "acc-test-1", "id_token": "", "chatgpt_user_id": "", "chatgpt_plan_type": "", "plan_type": ""},
+			attributes: map[string]string{"account_id": "acc-test-1", "chatgpt_user_id": "user-bbb", "chatgpt_plan_type": "team", "plan_type": "team"},
+			account:    "acc-test-1", plan: "free", defaulted: true, id: "e1e46a26-def3-4e3e-9ee2-185e59ed0444",
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {

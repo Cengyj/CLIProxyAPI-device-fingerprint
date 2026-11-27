@@ -384,40 +384,46 @@ func (e *CodexExecutor) refreshLocked(ctx context.Context, auth *cliproxyauth.Au
 				if errHome != nil {
 					outerErr = errHome
 				} else if refreshed != nil {
-					outerRefreshed = true
-					if refreshed.ID != "" {
-						auth.ID = refreshed.ID
+					// Home can complete either credential partition independently.
+					// A returned bearer confirms an outer result even if it did not
+					// rotate; identity-only or SIWC-only responses do not replace it.
+					if homeSIWC, okSIWC := refreshed.Metadata["siwc"].(map[string]any); okSIWC && codexSIWCAccessToken(refreshed) != "" {
+						existingSIWC = cloneSIWCMap(homeSIWC)
+						siwcRefreshed = true
+						needSIWC = false
 					}
-					if refreshed.Provider != "" {
-						auth.Provider = refreshed.Provider
-					}
-					auth.Index = refreshed.Index
-					if refreshed.Metadata != nil {
-						for k, val := range refreshed.Metadata {
-							if k == "siwc" || k == "use_siwc" {
-								continue
+					homeAccess, _ := refreshed.Metadata["access_token"].(string)
+					if strings.TrimSpace(homeAccess) == "" {
+						outerErr = statusErr{code: http.StatusBadGateway, msg: "home returned no outer OAuth credential"}
+					} else {
+						outerRefreshed = true
+						if refreshed.ID != "" {
+							auth.ID = refreshed.ID
+						}
+						if refreshed.Provider != "" {
+							auth.Provider = refreshed.Provider
+						}
+						auth.Index = refreshed.Index
+						if refreshed.Metadata != nil {
+							for k, val := range refreshed.Metadata {
+								if k == "siwc" || k == "use_siwc" {
+									continue
+								}
+								auth.Metadata[k] = val
 							}
-							auth.Metadata[k] = val
 						}
-						if homeSIWC, okSIWC := refreshed.Metadata["siwc"].(map[string]any); okSIWC && len(homeSIWC) > 0 {
-							if codexSIWCAccessToken(refreshed) != "" && codexSIWCAccessToken(refreshed) != codexSIWCAccessToken(beforeRefresh) {
-								existingSIWC = cloneSIWCMap(homeSIWC)
-								siwcRefreshed = true
-								needSIWC = false
+						if len(refreshed.Attributes) > 0 {
+							clonedAttributes := make(map[string]string, len(auth.Attributes)+len(refreshed.Attributes))
+							for k, v := range auth.Attributes {
+								clonedAttributes[k] = v
 							}
+							for k, v := range refreshed.Attributes {
+								clonedAttributes[k] = v
+							}
+							auth.Attributes = clonedAttributes
 						}
+						helps.AdoptCodexHomeIdentity(auth, refreshed)
 					}
-					if len(refreshed.Attributes) > 0 {
-						clonedAttributes := make(map[string]string, len(auth.Attributes)+len(refreshed.Attributes))
-						for k, v := range auth.Attributes {
-							clonedAttributes[k] = v
-						}
-						for k, v := range refreshed.Attributes {
-							clonedAttributes[k] = v
-						}
-						auth.Attributes = clonedAttributes
-					}
-					helps.AdoptCodexHomeIdentity(auth, refreshed)
 				}
 			}
 		} else {
