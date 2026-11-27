@@ -1,0 +1,140 @@
+name: Codex device fingerprint image
+
+on:
+  push:
+    branches:
+      - feat/codex-device-fingerprint
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: codex-device-fingerprint-image-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  linux-amd64:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build metadata
+        id: metadata
+        env:
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          image="ghcr.io/${REPOSITORY_OWNER,,}/cli-proxy-api"
+          tag="sha-${GITHUB_SHA:0:12}-amd64"
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=8.1.4-codex-${GITHUB_SHA:0:12}" >> "$GITHUB_OUTPUT"
+          echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build upstream-compatible amd64 image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: |
+            ${{ steps.metadata.outputs.image }}:${{ steps.metadata.outputs.tag }}
+            ${{ steps.metadata.outputs.image }}:latest-amd64
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          build-args: |
+            VERSION=${{ steps.metadata.outputs.version }}
+            COMMIT=${{ github.sha }}
+            BUILD_DATE=${{ steps.metadata.outputs.date }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Verify image before publishing
+        env:
+          IMAGE: ${{ steps.metadata.outputs.image }}
+          IMAGE_TAG: ${{ steps.metadata.outputs.tag }}
+        run: |
+          set -euo pipefail
+          test "$(docker image inspect "$IMAGE:$IMAGE_TAG" --format '{{.Architecture}}')" = amd64
+          docker run --rm --network none "$IMAGE:$IMAGE_TAG" ./CLIProxyAPI -h > image-help.log 2>&1
+          grep -F "Commit: $GITHUB_SHA" image-help.log
+          fixture="$(mktemp -d)"
+          trap 'docker rm -f codex-image-smoke >/dev/null 2>&1 || true; rm -rf "$fixture"' EXIT
+          mkdir -p "$fixture/auths"
+          cat > "$fixture/config.yaml" <<'EOF'
+          config-version: 8
+          server:
+            host: "0.0.0.0"
+            port: 8317
+            kv-store:
+              disabled: true
+          management:
+            disable-control-panel: true
+          access:
+            api-keys: ["synthetic-ci-image-smoke-key"]
+          oauth:
+            auth-dir: "/fixture/auths"
+            providers:
+              codex:
+                device-fingerprint-mode: device
+          EOF
+          docker run -d --name codex-image-smoke -p 127.0.0.1::8317 \
+            -v "$fixture:/fixture" "$IMAGE:$IMAGE_TAG" \
+            ./CLIProxyAPI --config /fixture/config.yaml --local-model --no-browser
+          port="$(docker port codex-image-smoke 8317/tcp | sed 's/.*://')"
+          ready=false
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent "http://127.0.0.1:$port/" > image-health.json; then
+              ready=true
+              break
+            fi
+            sleep 1
+          done
+          docker logs codex-image-smoke > image-startup.log 2>&1
+          test "$ready" = true
+
+      - name: Push amd64 image
+        env:
+          IMAGE: ${{ steps.metadata.outputs.image }}
+          IMAGE_TAG: ${{ steps.metadata.outputs.tag }}
+        run: |
+          set -euo pipefail
+          docker push "$IMAGE:$IMAGE_TAG"
+          docker push "$IMAGE:latest-amd64"
+          docker buildx imagetools inspect "$IMAGE:$IMAGE_TAG" | tee image-manifest.txt
+          {
+            echo "Image: $IMAGE:$IMAGE_TAG"
+            echo "Rolling tag: $IMAGE:latest-amd64"
+            echo "Commit: $GITHUB_SHA"
+            echo "Platform: linux/amd64; dynamic plugin support enabled by the upstream Dockerfile."
+            cat image-manifest.txt
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload image verification
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-verification-amd64
+          path: |
+            image-help.log
+            image-health.json
+            image-startup.log
+            image-manifest.txt
+          if-no-files-found: ignore
