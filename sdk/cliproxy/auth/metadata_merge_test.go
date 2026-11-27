@@ -3,7 +3,43 @@ package auth
 import (
 	"reflect"
 	"testing"
+
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/codex"
 )
+
+func TestCodexDeviceFingerprintRefreshMergeAdoptsIdentityHints(t *testing.T) {
+	base := &Auth{Provider: "codex", Metadata: map[string]any{
+		"access_token": "old-access", "refresh_token": "old-refresh", "id_token": "old-id", "account_id": "old-account",
+		"chatgpt_user_id": "old-member", "chatgpt_plan_type": "team", "plan_type": "team",
+	}, Attributes: map[string]string{"chatgpt_user_id": "old-member", "plan_type": "team"}}
+	current := base.Clone()
+	current.Attributes["chatgpt_user_id"] = "concurrent-stale-member"
+	current.Attributes["plan_type"] = "free"
+	current.Metadata["operator_note"] = "concurrent-admin"
+	current.Attributes["codex_installation_id"] = "11111111-2222-4333-8444-555555555555"
+	updated := base.Clone()
+	updated.Metadata["access_token"] = "new-access"
+	updated.Metadata["refresh_token"] = "new-refresh"
+	updated.Metadata["id_token"] = "new-id"
+	updated.Metadata["account_id"] = "new-account"
+	updated.Metadata["chatgpt_user_id"] = "new-member"
+	delete(updated.Metadata, "chatgpt_plan_type")
+	delete(updated.Attributes, "chatgpt_user_id")
+	updated.CodexRefreshPatch = codex.NewCredentialRefreshPatch(base.Metadata, updated.Metadata, true, false)
+	got := MergeRefreshedAuth(base, current, updated)
+	if got.Metadata["access_token"] != "new-access" || got.Metadata["chatgpt_user_id"] != "new-member" {
+		t.Fatal("matching refresh did not adopt the new credential identity")
+	}
+	if got.Attributes["chatgpt_user_id"] != "new-member" || got.Attributes["plan_type"] != "team" {
+		t.Fatal("auxiliary identity masked the adopted credential version")
+	}
+	if _, exists := got.Metadata["chatgpt_plan_type"]; exists {
+		t.Fatal("removed credential identity hint was restored")
+	}
+	if got.Metadata["operator_note"] != "concurrent-admin" || got.Attributes["codex_installation_id"] != current.Attributes["codex_installation_id"] {
+		t.Fatal("credential adoption lost independent administrator settings")
+	}
+}
 
 func TestMergeExistingAuthMetadataPreservesDisabledState(t *testing.T) {
 	target := &Auth{Metadata: map[string]any{"type": "claude"}}
@@ -29,6 +65,50 @@ func TestMergeExistingAuthMetadataKeepsExplicitDisabledState(t *testing.T) {
 	}
 	if disabled, _ := target.Metadata["disabled"].(bool); disabled {
 		t.Fatalf("metadata disabled = %v, want false", target.Metadata["disabled"])
+	}
+}
+
+func TestCodexDeviceFingerprintLoginMetadataOwnership(t *testing.T) {
+	for _, provider := range []string{"codex", "claude"} {
+		t.Run(provider, func(t *testing.T) {
+			storage := &dummyMetadataStorage{}
+			target := &Auth{Provider: provider, Storage: storage, Metadata: map[string]any{
+				"access_token": "new-access", "id_token": "new-id-token",
+			}}
+			identity := map[string]any{
+				"account_id": "old-account", "chatgpt_user_id": "old-member", "chatgpt_plan_type": "team",
+				"plan_type": "team", "plan_type_defaulted": false,
+			}
+			existing := map[string]any{
+				"access_token": "old-access", "id_token": "old-id-token", "disabled": true,
+				"codex_device_fingerprint": "device", "codex_installation_id": "11111111-2222-4333-8444-555555555555",
+				"header": map[string]any{"X-Operator": "keep"}, "proxy_url": "http://proxy.example.test", "operator_note": "keep",
+			}
+			for key, value := range identity {
+				existing[key] = value
+			}
+			MergeExistingAuthMetadata(target, existing)
+			if target.Metadata["access_token"] != "new-access" || target.Metadata["id_token"] != "new-id-token" {
+				t.Fatal("login metadata changed the acquired token version")
+			}
+			for key, value := range identity {
+				got, exists := target.Metadata[key]
+				if provider == "codex" && exists {
+					t.Errorf("Codex inherited old credential hint %s", key)
+				}
+				if provider != "codex" && (!exists || got != value) {
+					t.Errorf("shared metadata merge changed the %s behavior for %s", provider, key)
+				}
+			}
+			for _, key := range []string{"codex_device_fingerprint", "codex_installation_id", "header", "proxy_url", "operator_note", "disabled"} {
+				if !reflect.DeepEqual(target.Metadata[key], existing[key]) || !reflect.DeepEqual(storage.meta[key], existing[key]) {
+					t.Errorf("administrator setting %s was lost", key)
+				}
+			}
+			if !target.Disabled {
+				t.Fatal("disabled state was lost during re-login")
+			}
+		})
 	}
 }
 

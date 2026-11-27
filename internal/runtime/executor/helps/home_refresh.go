@@ -5,9 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/MoeForge/moego/json"
+	codexauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth/codex"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/home"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
@@ -85,6 +87,80 @@ type homeRefreshClient interface {
 
 var currentHomeRefreshClient = func() homeRefreshClient {
 	return home.Current()
+}
+
+// AdoptCodexHomeIdentity replaces identity hints with the adopted Home credential.
+func AdoptCodexHomeIdentity(target, source *cliproxyauth.Auth) {
+	if target == nil || source == nil {
+		return
+	}
+	identityString := func(key string) string {
+		if raw, exists := source.Metadata[key]; exists {
+			value, _ := raw.(string)
+			return strings.TrimSpace(value)
+		}
+		return strings.TrimSpace(source.Attributes[key])
+	}
+	account := identityString("account_id")
+	token := identityString("id_token")
+	member := identityString("chatgpt_user_id")
+	claimPlan := identityString("chatgpt_plan_type")
+	plan := identityString("plan_type")
+	defaulted, hasDefaulted := source.Metadata["plan_type_defaulted"].(bool)
+	if !hasDefaulted {
+		defaulted = strings.EqualFold(strings.TrimSpace(source.Attributes["plan_type_defaulted"]), "true")
+	}
+	if claims, errParse := codexauth.ParseJWTToken(token); errParse == nil && claims != nil {
+		claimAccount := strings.TrimSpace(claims.CodexAuthInfo.ChatgptAccountID)
+		if account == "" {
+			account = claimAccount
+		}
+		if claimAccount == "" || claimAccount == account {
+			if member == "" {
+				member = strings.TrimSpace(claims.CodexAuthInfo.ChatgptUserID)
+			}
+			if claimPlan == "" {
+				claimPlan = strings.TrimSpace(claims.CodexAuthInfo.ChatgptPlanType)
+			}
+		}
+	}
+	if plan == "" {
+		plan = claimPlan
+		defaulted = plan == ""
+		if defaulted {
+			plan = codexauth.DefaultPlanType
+		}
+	}
+
+	metadata := make(map[string]any, len(target.Metadata)+6)
+	for key, value := range target.Metadata {
+		metadata[key] = value
+	}
+	// Empty account and token values also clear them in a versioned refresh patch.
+	metadata["account_id"] = account
+	metadata["id_token"] = token
+	delete(metadata, "chatgpt_user_id")
+	delete(metadata, "chatgpt_plan_type")
+	if member != "" {
+		metadata["chatgpt_user_id"] = member
+	}
+	if claimPlan != "" {
+		metadata["chatgpt_plan_type"] = claimPlan
+	}
+	metadata["plan_type"] = plan
+	metadata["plan_type_defaulted"] = defaulted
+	target.Metadata = metadata
+
+	attributes := make(map[string]string, len(target.Attributes)+2)
+	for key, value := range target.Attributes {
+		attributes[key] = value
+	}
+	for _, key := range []string{"account_id", "id_token", "chatgpt_user_id", "chatgpt_plan_type"} {
+		delete(attributes, key)
+	}
+	attributes["plan_type"] = plan
+	attributes["plan_type_defaulted"] = strconv.FormatBool(defaulted)
+	target.Attributes = attributes
 }
 
 // RefreshAuthViaHome replaces local refresh logic when home control plane integration is enabled.

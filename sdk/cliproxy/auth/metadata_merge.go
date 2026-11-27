@@ -41,6 +41,14 @@ func MergeExistingAuthMetadata(target *Auth, existingMap map[string]any) {
 		if IsAuthTokenPayloadKey(k) {
 			continue
 		}
+		if strings.EqualFold(strings.TrimSpace(target.Provider), "codex") {
+			// These hints belong to the acquired outer credential. Re-login
+			// must not inherit an earlier account or member from custom metadata.
+			switch CanonicalCredentialMetadataKey(k) {
+			case "account_id", "chatgpt_user_id", "chatgpt_plan_type", "plan_type", "plan_type_defaulted":
+				continue
+			}
+		}
 		if strings.EqualFold(strings.TrimSpace(target.Provider), "meta") {
 			switch CanonicalCredentialMetadataKey(k) {
 			case "api_key", "dca_token", "dca_expired", "dca_expires_at":
@@ -290,6 +298,9 @@ func mergeAuthContent(base, current, updated *Auth) *Auth {
 				if trimmedKey == "proxy_url" || trimmedKey == "siwc" || trimmedKey == "use_siwc" {
 					continue
 				}
+				if updated.CodexRefreshPatch != nil && codex.IsCodexCredentialKey(trimmedKey) {
+					continue
+				}
 				if _, inUpdated := updated.Metadata[k]; !inUpdated {
 					if currentVal, ok := current.Metadata[k]; ok {
 						if reflect.DeepEqual(baseVal, currentVal) {
@@ -428,7 +439,9 @@ func mergeAuthContent(base, current, updated *Auth) *Auth {
 			}
 		}
 	}
-	if patch := updated.CodexRefreshPatch; patch != nil && patch.RefreshedOuter() && !patch.CanApplyOuterTo(current.Metadata) {
+	if patch := updated.CodexRefreshPatch; patch != nil && patch.RefreshedOuter() && patch.CanApplyOuterTo(current.Metadata) {
+		synchronizeCodexIdentityAttributes(merged)
+	} else if patch != nil && patch.RefreshedOuter() {
 		// A valid SIWC partition may allow this merge while the outer partition
 		// was superseded. Its identity hints must remain with its own tokens.
 		for _, key := range []string{"account_id", "id_token", "chatgpt_user_id", "chatgpt_plan_type", "plan_type", "plan_type_defaulted"} {

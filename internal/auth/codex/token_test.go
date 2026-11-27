@@ -7,8 +7,32 @@ import (
 	"runtime"
 	"testing"
 
+	"github.com/MoeForge/moego/ojson"
+
 	"github.com/MoeForge/moego/json"
 )
+
+func TestCodexDeviceFingerprintStorageSaveIntoEmptyFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "auth.json")
+	if errWrite := os.WriteFile(path, ojson.NewDocString(`{}`).Bytes(), 0600); errWrite != nil {
+		t.Fatal(errWrite)
+	}
+	storage := &CodexTokenStorage{AccessToken: "new-access", RefreshToken: "new-refresh", AccountID: "new-account"}
+	storage.SetMetadata(map[string]any{"operator_note": "keep"})
+	if errSave := storage.SaveTokenToFile(path); errSave != nil {
+		t.Fatal(errSave)
+	}
+	raw, errRead := os.ReadFile(path)
+	if errRead != nil {
+		t.Fatal(errRead)
+	}
+	if ojson.GetBytes(raw, "access_token").String() != "new-access" ||
+		ojson.GetBytes(raw, "refresh_token").String() != "new-refresh" ||
+		ojson.GetBytes(raw, "account_id").String() != "new-account" ||
+		ojson.GetBytes(raw, "operator_note").String() != "keep" {
+		t.Fatal("saving into an empty object lost incoming credentials or settings")
+	}
+}
 
 func TestSaveTokenToFile_PreservesCustomMetadata(t *testing.T) {
 	tempDir := t.TempDir()

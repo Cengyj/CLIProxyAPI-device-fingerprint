@@ -331,12 +331,15 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) ([
 				a.Attributes["plan_type_defaulted"] = "true"
 			}
 		} else if idTokenRaw, ok := metadata["id_token"].(string); ok && strings.TrimSpace(idTokenRaw) != "" {
+			a.Attributes["plan_type"] = codex.DefaultPlanType
+			a.Attributes["plan_type_defaulted"] = "true"
 			if claims, errParse := codex.ParseJWTToken(idTokenRaw); errParse == nil && claims != nil {
-				a.Attributes["plan_type"] = claims.GetPlanType()
-				a.Attributes["plan_type_defaulted"] = strconv.FormatBool(strings.TrimSpace(claims.CodexAuthInfo.ChatgptPlanType) == "")
-			} else {
-				a.Attributes["plan_type"] = codex.DefaultPlanType
-				a.Attributes["plan_type_defaulted"] = "true"
+				account, _ := metadata["account_id"].(string)
+				claimAccount := strings.TrimSpace(claims.CodexAuthInfo.ChatgptAccountID)
+				if strings.TrimSpace(account) == "" || claimAccount == "" || strings.TrimSpace(account) == claimAccount {
+					a.Attributes["plan_type"] = claims.GetPlanType()
+					a.Attributes["plan_type_defaulted"] = strconv.FormatBool(strings.TrimSpace(claims.CodexAuthInfo.ChatgptPlanType) == "")
+				}
 			}
 		}
 	}

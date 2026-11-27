@@ -263,13 +263,22 @@ func (a *CodexAuthenticator) buildAuthRecord(authSvc *codex.CodexAuth, authBundl
 		planType = tokenStorage.PlanType
 	}
 	hashAccountID := ""
+	userID := ""
+	claimPlanType := ""
 	if tokenStorage.IDToken != "" {
 		if claims, errParse := codex.ParseJWTToken(tokenStorage.IDToken); errParse == nil && claims != nil {
-			if pt := strings.TrimSpace(claims.CodexAuthInfo.ChatgptPlanType); pt != "" {
-				planType = pt
-				tokenStorage.PlanTypeDefaulted = false
-			}
 			accountID := strings.TrimSpace(claims.CodexAuthInfo.ChatgptAccountID)
+			if strings.TrimSpace(tokenStorage.AccountID) == "" {
+				tokenStorage.AccountID = accountID
+			}
+			if accountID == "" || accountID == strings.TrimSpace(tokenStorage.AccountID) {
+				userID = strings.TrimSpace(claims.CodexAuthInfo.ChatgptUserID)
+				claimPlanType = strings.TrimSpace(claims.CodexAuthInfo.ChatgptPlanType)
+				if claimPlanType != "" {
+					planType = claimPlanType
+					tokenStorage.PlanTypeDefaulted = false
+				}
+			}
 			if accountID != "" {
 				digest := sha256.Sum256([]byte(accountID))
 				hashAccountID = hex.EncodeToString(digest[:])[:8]
@@ -287,6 +296,16 @@ func (a *CodexAuthenticator) buildAuthRecord(authSvc *codex.CodexAuth, authBundl
 		"email":               tokenStorage.Email,
 		"plan_type":           planType,
 		"plan_type_defaulted": tokenStorage.PlanTypeDefaulted,
+	}
+	for key, value := range map[string]string{
+		"account_id":        tokenStorage.AccountID,
+		"id_token":          tokenStorage.IDToken,
+		"chatgpt_user_id":   userID,
+		"chatgpt_plan_type": claimPlanType,
+	} {
+		if value != "" {
+			metadata[key] = value
+		}
 	}
 
 	fmt.Println("Codex authentication successful")

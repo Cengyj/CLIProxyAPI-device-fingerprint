@@ -5,14 +5,171 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
 
 	"github.com/MoeForge/moego/json"
+	"github.com/MoeForge/moego/ojson"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 )
+
+func TestCodexDeviceFingerprintHomeRefreshIdentity(t *testing.T) {
+	const memberA = "2d1c341a-5607-4894-ae5e-6cf59c2e7dde"
+	const memberB = "fd5de10e-f853-4dd0-92f4-ece041b115a9"
+	for _, test := range []struct {
+		name                    string
+		metadata                map[string]any
+		attributes              map[string]string
+		account, user, plan, id string
+		defaulted               bool
+	}{
+		{
+			name:     "new member",
+			metadata: map[string]any{"account_id": "acc-team-1", "id_token": codexDeviceTestToken(t, "acc-team-1", "user-bbb", "team")},
+			account:  "acc-team-1", user: "user-bbb", plan: "team", id: memberB,
+		},
+		{
+			name:     "new account missing member",
+			metadata: map[string]any{"account_id": "acc-team-2", "id_token": codexDeviceTestToken(t, "acc-team-2", "", "team")},
+			account:  "acc-team-2", plan: "team", id: "e1adc2d3-5830-4ecd-b4ad-dcc4dd155b9a",
+		},
+		{
+			name:     "same subject missing claims",
+			metadata: map[string]any{"account_id": "acc-team-1", "id_token": codexDeviceTestToken(t, "acc-team-1", "", "")},
+			account:  "acc-team-1", plan: "free", defaulted: true, id: memberA,
+		},
+		{
+			name:     "same subject token rotation",
+			metadata: map[string]any{"account_id": "acc-team-1", "id_token": codexDeviceTestToken(t, "acc-team-1", "user-aaa", "team")},
+			account:  "acc-team-1", user: "user-aaa", plan: "team", id: memberA,
+		},
+		{
+			name:       "source attribute hints",
+			attributes: map[string]string{"account_id": "acc-team-1", "id_token": codexDeviceTestToken(t, "acc-team-1", "user-bbb", "team"), "chatgpt_user_id": "user-bbb", "plan_type": "team"},
+			account:    "acc-team-1", user: "user-bbb", plan: "team", id: memberB,
+		},
+		{
+			name:       "canonical metadata beats auxiliary attributes",
+			metadata:   map[string]any{"account_id": "acc-team-1", "id_token": codexDeviceTestToken(t, "acc-team-1", "user-bbb", "team")},
+			attributes: map[string]string{"account_id": "acc-team-2", "id_token": codexDeviceTestToken(t, "acc-team-2", "user-aaa", "free")},
+			account:    "acc-team-1", user: "user-bbb", plan: "team", id: memberB,
+		},
+		{
+			name:       "explicit absence clears auxiliary account and token",
+			metadata:   map[string]any{"account_id": "", "id_token": ""},
+			attributes: map[string]string{"account_id": "acc-team-2", "id_token": codexDeviceTestToken(t, "acc-team-2", "user-bbb", "team")},
+			plan:       "free", defaulted: true, id: memberA,
+		},
+		{
+			name:     "explicit free",
+			metadata: map[string]any{"account_id": "acc-test-1", "id_token": codexDeviceTestToken(t, "acc-test-1", "", ""), "plan_type": "free", "plan_type_defaulted": false},
+			account:  "acc-test-1", plan: "free", id: "e1e46a26-def3-4e3e-9ee2-185e59ed0444",
+		},
+		{
+			name:     "defaulted free missing plan",
+			metadata: map[string]any{"account_id": "acc-team-1", "id_token": codexDeviceTestToken(t, "acc-team-1", "user-bbb", ""), "plan_type": "free", "plan_type_defaulted": true},
+			account:  "acc-team-1", user: "user-bbb", plan: "free", defaulted: true, id: memberB,
+		},
+		{
+			name:     "foreign account claims",
+			metadata: map[string]any{"account_id": "acc-test-1", "id_token": codexDeviceTestToken(t, "acc-team-1", "user-bbb", "team")},
+			account:  "acc-test-1", plan: "free", defaulted: true, id: "e1e46a26-def3-4e3e-9ee2-185e59ed0444",
+		},
+		{
+			name:    "all identity absent",
+			account: "", plan: "free", defaulted: true, id: memberA,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := codexDeviceTestConfig()
+			cfg.Home.Enabled = true
+			old := codexDeviceTestAuth("codex-a.json", "acc-team-1")
+			old.Index = "home-auth"
+			old.Metadata["id_token"] = codexDeviceTestToken(t, "acc-team-1", "user-aaa", "team")
+			old.Metadata["chatgpt_user_id"] = "user-aaa"
+			old.Metadata["chatgpt_plan_type"] = "team"
+			old.Metadata["plan_type"] = "team"
+			old.Metadata["plan_type_defaulted"] = false
+			old.Metadata["codex_device_fingerprint"] = "device"
+			old.Metadata["operator_note"] = "keep"
+			old.Metadata["siwc"] = map[string]any{"access_token": "siwc-keep"}
+			old.Metadata["use_siwc"] = true
+			for _, key := range []string{"account_id", "id_token", "chatgpt_user_id", "chatgpt_plan_type", "plan_type"} {
+				old.Attributes[key], _ = old.Metadata[key].(string)
+			}
+			old.Attributes["plan_type_defaulted"] = "false"
+			old.Attributes["header:X-Operator"] = "keep"
+			originalAttributes := make(map[string]string, len(old.Attributes))
+			for key, value := range old.Attributes {
+				originalAttributes[key] = value
+			}
+			var resolver CodexDeviceResolver
+			if got := resolver.Resolve(cfg, old, false, codexDeviceTestURL).ID; got != memberA {
+				t.Fatal("initial member golden mismatch")
+			}
+			returned := &cliproxyauth.Auth{Provider: "codex", Metadata: test.metadata, Attributes: test.attributes}
+			raw := ojson.NewDocString(`{}`)
+			if errSet := raw.Set("auth", returned); errSet != nil {
+				t.Fatal(errSet)
+			}
+			client := &fakeHomeRefreshClient{raw: raw.Bytes()}
+			oldClient := currentHomeRefreshClient
+			currentHomeRefreshClient = func() homeRefreshClient { return client }
+			t.Cleanup(func() { currentHomeRefreshClient = oldClient })
+			updated, handled, errRefresh := RefreshAuthViaHome(context.Background(), cfg, old)
+			if errRefresh != nil || !handled || updated == nil {
+				t.Fatalf("refresh result = %v, %v", handled, errRefresh)
+			}
+			adopted := old.Clone()
+			for key, value := range updated.Metadata {
+				adopted.Metadata[key] = value
+			}
+			for key, value := range updated.Attributes {
+				adopted.Attributes[key] = value
+			}
+			AdoptCodexHomeIdentity(adopted, updated)
+			if got := adopted.Metadata["account_id"]; got != test.account {
+				t.Fatalf("adopted account mismatch")
+			}
+			if got, _ := adopted.Metadata["chatgpt_user_id"].(string); got != test.user {
+				t.Fatalf("adopted member mismatch")
+			}
+			if got := adopted.Metadata["plan_type"]; got != test.plan {
+				t.Fatalf("plan = %v, want %v", got, test.plan)
+			}
+			if got := adopted.Metadata["plan_type_defaulted"]; got != test.defaulted {
+				t.Fatalf("default provenance = %v, want %v", got, test.defaulted)
+			}
+			for _, key := range []string{"account_id", "id_token", "chatgpt_user_id", "chatgpt_plan_type"} {
+				if _, exists := adopted.Attributes[key]; exists {
+					t.Fatalf("stale attribute remains: %s", key)
+				}
+			}
+			if adopted.Metadata["operator_note"] != "keep" || adopted.Metadata["use_siwc"] != true || adopted.Metadata["siwc"].(map[string]any)["access_token"] != "siwc-keep" || adopted.Attributes["header:X-Operator"] != "keep" {
+				t.Fatal("administrator or SIWC metadata changed")
+			}
+			if !reflect.DeepEqual(old.Attributes, originalAttributes) || !reflect.DeepEqual(updated.Attributes, test.attributes) {
+				t.Fatal("input attribute map changed")
+			}
+			policy := resolver.Resolve(cfg, adopted, false, codexDeviceTestURL)
+			if policy.ID != test.id {
+				t.Fatal("adopted identity differs from golden")
+			}
+			body := ojson.NewDocString(`{"client_metadata":{"x-codex-installation-id":"old","x-codex-turn-metadata":"{\"installation_id\":\"old\",\"turn\":\"keep\"}"}}`)
+			if errApply := policy.ApplyDoc(body, false); errApply != nil {
+				t.Fatal(errApply)
+			}
+			headers := http.Header{"X-Codex-Turn-Metadata": {`{"installation_id":"old","turn":"keep"}`}}
+			policy.ApplyHeaders(headers)
+			if body.Get("client_metadata.x-codex-installation-id").String() != test.id || ojson.NewDocString(headers.Get("X-Codex-Turn-Metadata")).Get("installation_id").String() != test.id {
+				t.Fatal("body/header identity differs from adopted credential")
+			}
+		})
+	}
+}
 
 func TestStatusFromHomeErrorCodeMapsAuthenticationErrorToUnauthorized(t *testing.T) {
 	if got := statusFromHomeErrorCode("authentication_error"); got != http.StatusUnauthorized {

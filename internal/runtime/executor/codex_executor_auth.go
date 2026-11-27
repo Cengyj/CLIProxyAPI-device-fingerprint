@@ -417,6 +417,7 @@ func (e *CodexExecutor) refreshLocked(ctx context.Context, auth *cliproxyauth.Au
 						}
 						auth.Attributes = clonedAttributes
 					}
+					helps.AdoptCodexHomeIdentity(auth, refreshed)
 				}
 			}
 		} else {
@@ -430,8 +431,19 @@ func (e *CodexExecutor) refreshLocked(ctx context.Context, auth *cliproxyauth.Au
 				if td.RefreshToken != "" {
 					auth.Metadata["refresh_token"] = td.RefreshToken
 				}
-				if td.AccountID != "" {
-					auth.Metadata["account_id"] = td.AccountID
+				// Hints belong to the adopted OAuth credential, including absent
+				// claims. Keep absence out of persistence and let the bounded device
+				// resolver recover transient omissions only for a compatible subject.
+				auth.Metadata["account_id"] = td.AccountID
+				delete(auth.Metadata, "chatgpt_user_id")
+				delete(auth.Metadata, "chatgpt_plan_type")
+				if claims, errParse := codexauth.ParseJWTToken(td.IDToken); errParse == nil && claims != nil {
+					if member := strings.TrimSpace(claims.CodexAuthInfo.ChatgptUserID); member != "" {
+						auth.Metadata["chatgpt_user_id"] = member
+					}
+					if plan := strings.TrimSpace(claims.CodexAuthInfo.ChatgptPlanType); plan != "" {
+						auth.Metadata["chatgpt_plan_type"] = plan
+					}
 				}
 				auth.Metadata["email"] = td.Email
 				auth.Metadata["expired"] = td.Expire
@@ -454,6 +466,9 @@ func (e *CodexExecutor) refreshLocked(ctx context.Context, auth *cliproxyauth.Au
 				clonedAttributes := make(map[string]string, len(auth.Attributes)+1)
 				for k, v := range auth.Attributes {
 					clonedAttributes[k] = v
+				}
+				for _, key := range []string{"account_id", "id_token", "chatgpt_user_id", "chatgpt_plan_type"} {
+					delete(clonedAttributes, key)
 				}
 				clonedAttributes["plan_type"] = planType
 				clonedAttributes["plan_type_defaulted"] = strconv.FormatBool(planTypeDefaulted)

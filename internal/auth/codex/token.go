@@ -112,6 +112,8 @@ var codexOuterCredentialKeys = []string{
 	"access_token",
 	"refresh_token",
 	"account_id",
+	"chatgpt_user_id",
+	"chatgpt_plan_type",
 	"last_refresh",
 	"email",
 	"expired",
@@ -303,10 +305,23 @@ func (ts *CodexTokenStorage) SaveTokenToFile(authFilePath string) error {
 				return WriteJSONFileAtomic(authFilePath, ts.RefreshPatch.Apply(diskMap))
 			}
 			merged := MergeWithDiskMap(diskMap, data)
+			if ts.Metadata != nil && !ts.ReplaceCredentials && len(diskMap) > 0 {
+				// A metadata snapshot carries intentional configuration deletions.
+				merged = MergeCodexCredentialsFromDisk(diskMap, data)
+				for _, key := range codexOuterCredentialKeys {
+					if value, exists := diskMap[key]; exists {
+						merged[key] = value
+					} else {
+						delete(merged, key)
+					}
+				}
+			}
 			if ts.ReplaceCredentials {
 				for _, key := range codexOuterCredentialKeys {
 					if value, exists := data[key]; exists {
 						merged[key] = value
+					} else {
+						delete(merged, key)
 					}
 				}
 			}

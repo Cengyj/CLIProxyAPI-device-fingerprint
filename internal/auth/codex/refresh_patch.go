@@ -119,7 +119,7 @@ func applyCredentialFields(disk, before, after map[string]any) {
 			disk[key] = value
 		}
 	}
-	for _, key := range []string{"expires_at", "earliest_refresh_at"} {
+	for _, key := range []string{"expires_at", "earliest_refresh_at", "chatgpt_user_id", "chatgpt_plan_type"} {
 		if _, had := before[key]; had {
 			if _, has := after[key]; !has {
 				delete(disk, key)
@@ -312,6 +312,15 @@ func (p *CredentialRefreshPatch) Apply(disk map[string]any) map[string]any {
 	if p.outerAfter != nil {
 		if ok, base := matchesBaselineOrAfter(disk, p.outerBefore, p.outerDiskBefore, p.outerAfter); ok {
 			applyCredentialFields(merged, base, p.outerAfter)
+			// Identity hints belong to the adopted credential snapshot, including
+			// unchanged and absent fields. Independent administrator edits survive.
+			for _, key := range []string{"account_id", "id_token", "chatgpt_user_id", "chatgpt_plan_type", "plan_type", "plan_type_defaulted"} {
+				if value, exists := p.outerAfter[key]; exists {
+					merged[key] = value
+				} else {
+					delete(merged, key)
+				}
+			}
 		}
 	}
 	diskSIWC, _ := disk["siwc"].(map[string]any)

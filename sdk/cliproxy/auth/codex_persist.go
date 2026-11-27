@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/MoeForge/moego/json"
@@ -73,6 +74,7 @@ func PersistCodexAuthFile(ctx context.Context, path string, auth *Auth) (bool, e
 		}
 		auth.CodexRefreshPatch = nil
 		auth.Storage = nil
+		synchronizeCodexIdentityAttributes(auth)
 		if disabled, ok := auth.Metadata["disabled"].(bool); ok {
 			auth.Disabled = disabled
 		}
@@ -97,8 +99,16 @@ func PersistCodexAuthFile(ctx context.Context, path string, auth *Auth) (bool, e
 		if persistedBytes, errReadPersisted := os.ReadFile(path); errReadPersisted == nil && len(persistedBytes) > 0 {
 			var diskMap map[string]any
 			if errUnmarshal := json.Unmarshal(persistedBytes, &diskMap); errUnmarshal == nil && len(diskMap) > 0 {
-				auth.Metadata = codex.MergeCodexCredentialsFromDisk(diskMap, auth.Metadata)
+				auth.Metadata = diskMap
 				NormalizeCredentialMetadata(auth.Metadata)
+				synchronizeCodexIdentityAttributes(auth)
+				if _, ok := auth.Storage.(*codex.CodexTokenStorage); ok {
+					var savedStorage codex.CodexTokenStorage
+					if errDecode := json.Unmarshal(persistedBytes, &savedStorage); errDecode == nil {
+						savedStorage.SetMetadata(auth.Metadata)
+						auth.Storage = &savedStorage
+					}
+				}
 			}
 		}
 		return true, nil
@@ -127,9 +137,44 @@ func PersistCodexAuthFile(ctx context.Context, path string, auth *Auth) (bool, e
 		if errLock != nil {
 			return true, errLock
 		}
+		synchronizeCodexIdentityAttributes(auth)
 		return true, nil
 
 	default:
 		return false, nil
+	}
+}
+
+// synchronizeCodexIdentityAttributes keeps auxiliary hints with the persisted
+// credential partition. Administrator device and header overrides are independent.
+func synchronizeCodexIdentityAttributes(auth *Auth) {
+	if auth.Attributes == nil {
+		return
+	}
+	attributes := make(map[string]string, len(auth.Attributes))
+	for key, value := range auth.Attributes {
+		attributes[key] = value
+	}
+	auth.Attributes = attributes
+	for _, key := range []string{"account_id", "id_token", "chatgpt_user_id", "chatgpt_plan_type", "plan_type", "plan_type_defaulted"} {
+		delete(auth.Attributes, key)
+		if value, ok := auth.Metadata[key].(string); ok && strings.TrimSpace(value) != "" {
+			auth.Attributes[key] = value
+		}
+	}
+	if defaulted, ok := auth.Metadata["plan_type_defaulted"].(bool); ok {
+		auth.Attributes["plan_type_defaulted"] = strconv.FormatBool(defaulted)
+	}
+	if strings.TrimSpace(auth.Attributes["plan_type"]) == "" {
+		if idToken, ok := auth.Metadata["id_token"].(string); ok {
+			if claims, errParse := codex.ParseJWTToken(idToken); errParse == nil && claims != nil {
+				account, _ := auth.Metadata["account_id"].(string)
+				claimAccount := strings.TrimSpace(claims.CodexAuthInfo.ChatgptAccountID)
+				if strings.TrimSpace(account) == "" || claimAccount == "" || strings.TrimSpace(account) == claimAccount {
+					auth.Attributes["plan_type"] = claims.GetPlanType()
+					auth.Attributes["plan_type_defaulted"] = strconv.FormatBool(strings.TrimSpace(claims.CodexAuthInfo.ChatgptPlanType) == "")
+				}
+			}
+		}
 	}
 }
